@@ -143,7 +143,7 @@ jobs:
 
       - name: Extract version
         id: version
-        run: echo "val=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].version')" >> $GITHUB_OUTPUT
+        run: echo "val=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name == "wings-rs") | .version')" >> $GITHUB_OUTPUT
 
       - name: Build & push multi-arch image (main)
         id: build
@@ -152,6 +152,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64,linux/riscv64,linux/ppc64le
           push: true
+          build-args: |
+            WINGS_VERSION=${{ steps.version.outputs.val }}
           tags: |
             ${{ env.GHCR_IMAGE }}:nightly
             ${{ env.DOCKERHUB_IMAGE }}:nightly

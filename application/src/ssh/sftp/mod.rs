@@ -1402,6 +1402,9 @@ impl russh_sftp::server::Handler for SftpSession {
         if !self.allow_action() {
             return Err(StatusCode::PermissionDenied);
         }
+        if self.server.bandwidth.blocked() {
+            return Err(StatusCode::PermissionDenied);
+        }
 
         let handle = match self.handles.get_mut(handle.as_str()) {
             Some(ServerHandle::File(handle)) => handle,
@@ -1428,6 +1431,8 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::Eof);
         }
 
+        self.server.bandwidth.record_stream(0, data.len() as u64);
+
         Ok(Data { id, data })
     }
 
@@ -1439,6 +1444,9 @@ impl russh_sftp::server::Handler for SftpSession {
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
         if !self.allow_action() {
+            return Err(StatusCode::PermissionDenied);
+        }
+        if self.server.bandwidth.blocked() {
             return Err(StatusCode::PermissionDenied);
         }
 
@@ -1458,6 +1466,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::BadMessage);
         }
 
+        let bytes = data.len() as u64;
         tokio::task::spawn_blocking({
             let file = Arc::clone(&handle.file);
             let append = handle.append;
@@ -1477,6 +1486,7 @@ impl russh_sftp::server::Handler for SftpSession {
         .map_err(|_| StatusCode::Failure)?;
 
         handle.diff_dirty = true;
+        self.server.bandwidth.record_stream(bytes, 0);
 
         Ok(Status {
             id,

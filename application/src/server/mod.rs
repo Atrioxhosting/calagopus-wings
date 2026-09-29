@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
 };
 use tokio::{
@@ -17,6 +17,7 @@ use crate::io::SafeSliceExt;
 
 pub mod activity;
 pub mod backup;
+pub mod bandwidth;
 pub mod collab;
 pub mod configuration;
 pub mod diff;
@@ -62,6 +63,8 @@ pub struct InnerServer {
     pub collab: collab::manager::CollabManager,
     pub diff: diff::manager::DiffManager,
     pub activity: activity::ActivityManager,
+    pub bandwidth: bandwidth::Ledger,
+    bandwidth_per_gib: AtomicI64,
 
     pub state: state::ServerStateLock,
     pub outgoing_transfer: RwLock<Option<transfer::OutgoingServerTransfer>>,
@@ -85,6 +88,9 @@ pub struct InnerServer {
 
 impl Drop for InnerServer {
     fn drop(&mut self) {
+        if let Err(err) = self.bandwidth.checkpoint() {
+            tracing::error!(server = %self.uuid, error = %err, "CRITICAL: failed to checkpoint bandwidth ledger on shutdown");
+        }
         tracing::info!(
             server = %self.uuid,
             "dropping server instance"
@@ -203,7 +209,18 @@ impl Server {
         let schedules = Arc::new(schedule::manager::ScheduleManager::new(Arc::clone(
             &app_state.config,
         )));
+        let ledger_path = app_state
+            .config
+            .resolve_as_path(|cfg| &cfg.system.root_directory)
+            .join("bandwidth")
+            .join(format!("{}.json", configuration.uuid));
+        let bandwidth = bandwidth::Ledger::new(
+            ledger_path,
+            configuration.created.unwrap_or_else(chrono::Utc::now),
+            configuration.billing_period.as_ref(),
+        );
 
+        let bandwidth_per_gib = configuration.bandwidth_per_gib;
         let server = Self(Arc::new(InnerServer {
             uuid: configuration.uuid,
             app_state,
@@ -224,6 +241,8 @@ impl Server {
             collab,
             diff,
             activity,
+            bandwidth,
+            bandwidth_per_gib: AtomicI64::new(bandwidth_per_gib),
 
             state: state::ServerStateLock::new(websocket_tx, schedules),
             outgoing_transfer: RwLock::new(None),
@@ -246,8 +265,101 @@ impl Server {
         }));
 
         server.spawn_stats_forwarder();
+        server.spawn_bandwidth_task();
 
         server
+    }
+
+    fn spawn_bandwidth_task(&self) {
+        let weak = Arc::downgrade(&self.0);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut checkpoint_tick = 0u8;
+            let mut first_tick = true;
+            loop {
+                interval.tick().await;
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                let server = Server(inner);
+                let configuration = server.configuration.read().await;
+                let period_changed = if let Some(created) = configuration.created {
+                    match server
+                        .bandwidth
+                        .period(created, configuration.billing_period.as_ref())
+                    {
+                        Ok(changed) => changed,
+                        Err(err) => {
+                            tracing::error!(server = %server.uuid, error = %err, "CRITICAL: bandwidth period transition failed");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                let quota = bandwidth::quota_bytes(
+                    configuration.build.memory_limit,
+                    configuration.bandwidth_per_gib,
+                );
+                drop(configuration);
+                let usage = server.resource_usage();
+                server
+                    .bandwidth
+                    .observe_container(usage.network.rx_bytes, usage.network.tx_bytes);
+                if let Some((rx, tx)) = server.poll_tundra_traffic().await {
+                    server.bandwidth.observe_tundra(rx, tx);
+                }
+                checkpoint_tick = (checkpoint_tick + 1) % 10;
+                if checkpoint_tick == 0
+                    && let Err(err) = server.bandwidth.retry_failed_checkpoint()
+                {
+                    tracing::error!(server = %server.uuid, error = %err, "CRITICAL: failed to retry bandwidth ledger checkpoint");
+                }
+                let process_state = server.state.get_state();
+                let running = matches!(
+                    process_state,
+                    state::ServerState::Running | state::ServerState::Starting
+                );
+                server.bandwidth.evaluate(quota, running);
+                if process_state != state::ServerState::Offline && server.bandwidth.mark_stopping()
+                {
+                    server
+                        .log_daemon_with_prelude("Bandwidth quota reached. Stopping the service.");
+                    let stopping_server = server.clone();
+                    tokio::spawn(async move {
+                        stopping_server.enforce_bandwidth_stop().await;
+                    });
+                } else if process_state == state::ServerState::Offline
+                    && matches!(
+                        server.bandwidth.snapshot().state.as_str(),
+                        "stopping" | "stop_failed" | "enforcement_unknown"
+                    )
+                {
+                    server.bandwidth.stopped(true);
+                }
+                if period_changed || first_tick {
+                    server.schedule_bandwidth_restore_if_ready();
+                }
+                first_tick = false;
+            }
+        });
+    }
+
+    pub async fn poll_tundra_traffic(&self) -> Option<(u64, u64)> {
+        let tundra = self.app_state.tundra.as_ref()?;
+        let metrics = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tundra.hub.request_metrics(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let server = self.uuid.to_string();
+        let traffic = metrics.get("service_traffic")?.get(server.as_str())?;
+        Some((
+            traffic.get("rx_bytes")?.as_u64()?,
+            traffic.get("tx_bytes")?.as_u64()?,
+        ))
     }
 
     fn spawn_stats_forwarder(&self) {
@@ -262,6 +374,7 @@ impl Server {
 
                 let mut usage = *usage_rx.borrow_and_update();
                 usage.state = server.state.get_state();
+                Server(Arc::clone(&server)).fill_bandwidth_usage(&mut usage);
 
                 server
                     .websocket
@@ -730,8 +843,78 @@ impl Server {
     pub fn resource_usage(&self) -> resources::ResourceUsage {
         let mut usage = *self.resource_usage.borrow();
         usage.state = self.state.get_state();
+        self.fill_bandwidth_usage(&mut usage);
 
         usage
+    }
+
+    fn fill_bandwidth_usage(&self, usage: &mut resources::ResourceUsage) {
+        let state = self.bandwidth.snapshot();
+        usage.bandwidth = resources::BandwidthUsage {
+            used_bytes: state.used_bytes,
+            quota_bytes: state.quota_bytes,
+            rx_bytes: state.rx_bytes,
+            tx_bytes: state.tx_bytes,
+            period_start: state.period_start.timestamp(),
+            period_end: state.period_end.timestamp(),
+            bandwidth_per_gib: self.bandwidth_per_gib.load(Ordering::Relaxed),
+            state: match state.state.as_str() {
+                "quota_exceeded" => resources::BandwidthState::QuotaExceeded,
+                "stopping" => resources::BandwidthState::Stopping,
+                "stopped_quota" => resources::BandwidthState::StoppedQuota,
+                "restore_pending" => resources::BandwidthState::RestorePending,
+                "stop_failed" => resources::BandwidthState::StopFailed,
+                "enforcement_unknown" => resources::BandwidthState::EnforcementUnknown,
+                _ => resources::BandwidthState::Active,
+            },
+            resume_after_quota: state.resume_after_quota,
+            generation: state.generation,
+            last_checkpoint: state.last_checkpoint.timestamp(),
+        };
+    }
+
+    fn schedule_bandwidth_restore(&self) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = server
+                .start(Some(std::time::Duration::from_secs(5)), false)
+                .await
+            {
+                tracing::error!(server = %server.uuid, error = %err, "failed to restore service after bandwidth release");
+            }
+        });
+    }
+
+    fn schedule_bandwidth_restore_if_ready(&self) {
+        if self.bandwidth.snapshot().state == "restore_pending"
+            && self.state.get_state() == state::ServerState::Offline
+            && self.locked_state().is_none()
+        {
+            self.schedule_bandwidth_restore();
+        }
+    }
+
+    async fn enforce_bandwidth_stop(&self) {
+        let timeout = std::time::Duration::from_secs(30);
+        let result = self.stop_with_kill_timeout(timeout, true).await;
+        let confirmed = self
+            .state
+            .wait_for_state(
+                state::ServerState::Offline,
+                std::time::Duration::from_secs(10),
+            )
+            .await;
+        if let Err(error) = &result {
+            tracing::error!(server = %self.uuid, error = %error, "bandwidth quota stop failed");
+        }
+        if confirmed {
+            self.bandwidth.stopped(true);
+            self.schedule_bandwidth_restore_if_ready();
+        } else if result.is_err() {
+            self.bandwidth.stopped(false);
+        } else {
+            self.bandwidth.enforcement_unknown();
+        }
     }
 
     pub async fn update_configuration(
@@ -764,7 +947,13 @@ impl Server {
             }
         }
         *self.process_configuration.write().await = process_configuration;
+        self.bandwidth_per_gib.store(
+            self.configuration.read().await.bandwidth_per_gib,
+            Ordering::Relaxed,
+        );
         self.schedules.update_schedules(self.clone()).await;
+
+        self.reevaluate_bandwidth().await;
 
         if let Err(err) = self.sync_container().await {
             tracing::error!(
@@ -772,6 +961,37 @@ impl Server {
                 "failed to sync container: {}",
                 err
             );
+        }
+    }
+
+    pub async fn reevaluate_bandwidth(&self) {
+        let configuration = self.configuration.read().await;
+        if let Some(created) = configuration.created {
+            if let Err(err) = self
+                .bandwidth
+                .period(created, configuration.billing_period.as_ref())
+            {
+                tracing::error!(server = %self.uuid, error = %err, "CRITICAL: bandwidth period transition failed");
+            }
+        }
+        let quota = bandwidth::quota_bytes(
+            configuration.build.memory_limit,
+            configuration.bandwidth_per_gib,
+        );
+        drop(configuration);
+        let process_state = self.state.get_state();
+        let running = matches!(
+            process_state,
+            state::ServerState::Running | state::ServerState::Starting
+        );
+        self.bandwidth.evaluate(quota, running);
+        if process_state != state::ServerState::Offline && self.bandwidth.mark_stopping() {
+            let server = self.clone();
+            tokio::spawn(async move {
+                server.enforce_bandwidth_stop().await;
+            });
+        } else {
+            self.schedule_bandwidth_restore_if_ready();
         }
     }
 
@@ -1153,23 +1373,23 @@ impl Server {
                             server.app_state.config.client.server(server.uuid),
                         );
 
-                        match configuration {
-                            Ok(configuration) => {
-                                server
-                                    .update_configuration(
-                                        configuration.settings,
-                                        configuration.process_configuration,
-                                        true,
-                                    )
-                                    .await;
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    server = %server.uuid,
-                                    "failed to sync server configuration: {}",
-                                    err
-                                );
-                            }
+                        let configuration = configuration.map_err(|err| {
+                            tracing::error!(server = %server.uuid, "failed to fetch current server configuration: {}", err);
+                            anyhow::anyhow!("Cannot start without current Panel configuration: {err}")
+                        })?;
+                        server
+                            .update_configuration(
+                                configuration.settings,
+                                configuration.process_configuration,
+                                true,
+                            )
+                            .await;
+
+                        if let Some(state) = server.locked_state() {
+                            return Err(anyhow::anyhow!("Server is locked ({state}), cannot start."));
+                        }
+                        if server.bandwidth.blocked() {
+                            return Err(anyhow::anyhow!("Bandwidth quota reached; cannot start the server."));
                         }
 
                         if !server.filesystem.disk_checker_state_dirty.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1252,6 +1472,7 @@ impl Server {
                         };
 
                         process_handle.start().await?;
+                        server.bandwidth.started();
 
                         Ok(())
                     },
@@ -1530,9 +1751,13 @@ impl Server {
         match (action, kill_timeout) {
             (ServerPowerAction::Start, _) => self.start(aquire_timeout, false).await,
             (ServerPowerAction::Stop, Some(timeout)) => {
+                self.bandwidth.disable_resume();
                 self.stop_with_kill_timeout(timeout, false).await
             }
-            (ServerPowerAction::Stop, None) => self.stop(aquire_timeout, false).await,
+            (ServerPowerAction::Stop, None) => {
+                self.bandwidth.disable_resume();
+                self.stop(aquire_timeout, false).await
+            }
             (ServerPowerAction::Restart, Some(timeout)) => {
                 self.restart_with_kill_timeout(aquire_timeout, timeout)
                     .await

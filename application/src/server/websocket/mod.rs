@@ -567,13 +567,26 @@ impl ServerWebsocketHandler {
             Message::Text(message.into())
         };
 
-        if let Err(err) = self.sender.lock().await.send(message).await
-            && err.source().is_none_or(|e| {
-                e.downcast_ref::<std::io::Error>()
-                    .is_none_or(|i| i.kind() != std::io::ErrorKind::BrokenPipe)
-            })
-        {
-            tracing::error!("failed to send websocket message: {:?}", err);
+        let bytes = match &message {
+            Message::Text(text) => text.len() as u64,
+            Message::Binary(binary) => binary.len() as u64,
+            _ => 0,
+        };
+        match self.sender.lock().await.send(message).await {
+            Ok(()) => {
+                if self.socket_jwt.read().await.is_some() {
+                    self.server.bandwidth.record_stream(0, bytes);
+                }
+            }
+            Err(err)
+                if err.source().is_none_or(|e| {
+                    e.downcast_ref::<std::io::Error>()
+                        .is_none_or(|i| i.kind() != std::io::ErrorKind::BrokenPipe)
+                }) =>
+            {
+                tracing::error!("failed to send websocket message: {:?}", err)
+            }
+            Err(_) => {}
         }
     }
 

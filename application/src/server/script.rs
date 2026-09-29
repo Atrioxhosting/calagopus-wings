@@ -27,6 +27,9 @@ pub async fn script_server(
     let (buf_stdout_rx, mut buf_stdout_tx) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
 
     tokio::spawn(async move {
+        // Keep the process handle and its network sampler alive until the
+        // script's output stream closes.
+        let _handle = handle;
         loop {
             match stdout_rx.recv().await {
                 Ok(data) => {

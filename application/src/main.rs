@@ -615,6 +615,57 @@ async fn main_rt() {
         tundra,
     });
 
+    #[cfg(unix)]
+    tokio::spawn({
+        let server_manager = Arc::clone(&state.server_manager);
+
+        async move {
+            let mut terminate = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            ) {
+                Ok(signal) => signal,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to register SIGTERM handler for bandwidth checkpoints");
+                    return;
+                }
+            };
+            let mut interrupt = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::interrupt(),
+            ) {
+                Ok(signal) => signal,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to register SIGINT handler for bandwidth checkpoints");
+                    return;
+                }
+            };
+
+            tokio::select! {
+                _ = terminate.recv() => tracing::info!("received SIGTERM, checkpointing bandwidth ledgers"),
+                _ = interrupt.recv() => tracing::info!("received SIGINT, checkpointing bandwidth ledgers"),
+            }
+
+            let servers = server_manager
+                .get_servers()
+                .await
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            match tokio::task::spawn_blocking(move || {
+                for server in servers {
+                    if let Err(err) = server.bandwidth.checkpoint() {
+                        tracing::error!(server = %server.uuid, error = %err, "CRITICAL: failed to checkpoint bandwidth ledger on shutdown");
+                    }
+                }
+            })
+            .await
+            {
+                Ok(()) => {}
+                Err(err) => tracing::error!(error = %err, "CRITICAL: bandwidth checkpoint task failed on shutdown"),
+            }
+            std::process::exit(0);
+        }
+    });
+
     tokio::spawn({
         let state = Arc::clone(&state);
 

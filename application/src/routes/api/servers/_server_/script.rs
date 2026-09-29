@@ -24,9 +24,14 @@ mod post {
         crate::Payload(data): crate::Payload<InstallationScript>,
     ) -> ApiResponseResult {
         match crate::server::script::script_server(&server, &state.executor, data).await {
-            Ok(stdout_stream) => ApiResponse::new_stream(stdout_stream)
-                .with_header("Content-Type", "text/plain")
-                .ok(),
+            Ok(stdout_stream) => ApiResponse::new_stream(
+                crate::io::bandwidth_reader::BandwidthReader::new_administrative(
+                    stdout_stream,
+                    server.0.clone(),
+                ),
+            )
+            .with_header("Content-Type", "text/plain")
+            .ok(),
             Err(err) => {
                 tracing::error!(
                     server = %server.uuid,

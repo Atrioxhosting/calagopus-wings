@@ -11,6 +11,7 @@ mod get {
         extract::Query,
         http::{HeaderMap, StatusCode},
     };
+    use futures::StreamExt;
     use serde::Deserialize;
     use utoipa::ToSchema;
 
@@ -62,14 +63,6 @@ mod get {
 
         crate::routes::token::consume(&state, &payload.unique_id)?;
 
-        if let Some(server_uuid) = payload.server_uuid
-            && state.server_manager.get_server(server_uuid).await.is_none()
-        {
-            return ApiResponse::error("server not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
         let backup = match state
             .backup_manager
             .find(&state, payload.backup_uuid)
@@ -81,6 +74,27 @@ mod get {
                     .with_status(StatusCode::NOT_FOUND)
                     .ok();
             }
+        };
+
+        let service = if matches!(&*backup, crate::server::backup::Backup::Wings(_)) {
+            let Some(server_uuid) = payload.server_uuid else {
+                return ApiResponse::error("backup has no service owner")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            };
+            let Some(server) = state.server_manager.get_server(server_uuid).await else {
+                return ApiResponse::error("server not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            };
+            if server.bandwidth.blocked() {
+                return ApiResponse::error("bandwidth quota reached")
+                    .with_status(StatusCode::FORBIDDEN)
+                    .ok();
+            }
+            Some(server)
+        } else {
+            None
         };
 
         let download = if payload.database {
@@ -95,7 +109,7 @@ mod get {
                 .await
         };
 
-        match download {
+        let mut response = match download {
             Ok(response) => response,
             Err(err) => {
                 tracing::error!("failed to download backup: {:?}", err);
@@ -103,8 +117,26 @@ mod get {
                 ApiResponse::error("failed to download backup")
                     .with_status(StatusCode::EXPECTATION_FAILED)
             }
+        };
+        if let Some(server) = service {
+            response.body = axum::body::Body::from_stream(response.body.into_data_stream().map(
+                move |result| {
+                    if server.bandwidth.blocked() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "bandwidth quota reached",
+                        ));
+                    }
+                    result
+                        .map(|chunk| {
+                            server.bandwidth.record_stream(0, chunk.len() as u64);
+                            chunk
+                        })
+                        .map_err(std::io::Error::other)
+                },
+            ));
         }
-        .ok()
+        response.ok()
     }
 }
 

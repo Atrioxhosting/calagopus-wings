@@ -323,13 +323,11 @@ impl StatFiles {
     }
 
     pub fn parse_net_dev(contents: &str) -> Option<(u64, u64, u64, u64)> {
-        let mut totals: Option<(u64, u64, u64, u64)> = None;
-
         for line in contents.lines().skip(2) {
             let Some((iface, counters)) = line.split_once(':') else {
                 continue;
             };
-            if iface.trim() == "lo" {
+            if iface.trim() != "eth0" {
                 continue;
             }
 
@@ -339,14 +337,10 @@ impl StatFiles {
                 continue;
             };
 
-            let total = totals.get_or_insert((0, 0, 0, 0));
-            total.0 = total.0.saturating_add(rx_bytes);
-            total.1 = total.1.saturating_add(rx_packets);
-            total.2 = total.2.saturating_add(tx_bytes);
-            total.3 = total.3.saturating_add(tx_packets);
+            return Some((rx_bytes, rx_packets, tx_bytes, tx_packets));
         }
 
-        totals
+        None
     }
 }
 
@@ -649,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_net_dev_sums_every_real_interface() {
+    fn parse_net_dev_uses_only_eth0() {
         let net_dev = "Inter-|   Receive                                                |  Transmit\n\
              face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
                 lo:    1000      10    0    0    0     0          0         0     1000      10    0    0    0     0       0          0\n\
@@ -658,7 +652,7 @@ mod tests {
 
         assert_eq!(
             StatFiles::parse_net_dev(net_dev),
-            Some((5500, 55, 7700, 77))
+            Some((5000, 50, 7000, 70))
         );
     }
 

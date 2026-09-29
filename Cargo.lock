@@ -5397,7 +5397,6 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tundra-common"
 version = "1.0.1"
-source = "git+https://github.com/calagopus/tundra.git#ccb05e1406232f8c39f05a984133277026cd79d6"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -6105,7 +6104,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "wings-rs"
-version = "1.2.3"
+version = "1.2.2+atriox.1"
 dependencies = [
  "accept-header",
  "aho-corasick",

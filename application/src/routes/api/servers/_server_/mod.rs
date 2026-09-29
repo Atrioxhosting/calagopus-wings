@@ -10,6 +10,7 @@ use axum::{
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod backup;
+mod bandwidth;
 mod commands;
 mod database_backup;
 mod files;
@@ -112,6 +113,7 @@ mod delete {
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
+        .nest("/bandwidth", bandwidth::router(state))
         .nest("/utilization", utilization::router(state))
         .nest("/logs", logs::router(state))
         .nest("/install", install::router(state))

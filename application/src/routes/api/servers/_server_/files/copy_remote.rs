@@ -406,6 +406,11 @@ mod post {
                     .ok()
             }
         } else {
+            if server.bandwidth.blocked() {
+                return ApiResponse::error("bandwidth quota reached; remote copy is blocked")
+                    .with_status(StatusCode::CONFLICT)
+                    .ok();
+            }
             let (identifier, task) = server
                 .filesystem
                 .operations
@@ -485,7 +490,7 @@ mod post {
                                     "archive",
                                     reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
                                         tokio_util::io::ReaderStream::with_capacity(
-                                            reader,
+                                            crate::io::bandwidth_reader::BandwidthReader::new(reader, server.0.clone()),
                                             crate::BUFFER_SIZE,
                                         ),
                                     ))

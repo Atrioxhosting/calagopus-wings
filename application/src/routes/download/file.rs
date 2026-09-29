@@ -63,6 +63,11 @@ mod get {
         crate::routes::token::consume(&state, &payload.unique_id)?;
 
         let server = crate::routes::token::server(&state, payload.server_uuid).await?;
+        if server.bandwidth.blocked() {
+            return ApiResponse::error("bandwidth quota reached")
+                .with_status(StatusCode::FORBIDDEN)
+                .ok();
+        }
 
         let parent = Path::new(&payload.file_path)
             .parent()
@@ -153,8 +158,10 @@ mod get {
             headers.insert("Last-Modified", modified.to_rfc2822().parse()?);
         }
 
-        let reader =
-            AsyncFixedReader::new_with_fixed_bytes(file_read.reader, file_read.size as usize);
+        let reader = crate::io::bandwidth_reader::BandwidthReader::new(
+            AsyncFixedReader::new_with_fixed_bytes(file_read.reader, file_read.size as usize),
+            server.clone(),
+        );
 
         if file_read.reader_range.is_some() {
             ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE)

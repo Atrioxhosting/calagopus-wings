@@ -491,7 +491,10 @@ impl OutgoingServerTransfer {
                 .part(
                     "archive",
                     reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
-                        tokio_util::io::ReaderStream::with_capacity(reader, crate::TRANSFER_BUFFER_SIZE),
+                        tokio_util::io::ReaderStream::with_capacity(
+                            crate::io::bandwidth_reader::BandwidthReader::new_administrative(reader, server.clone()),
+                            crate::TRANSFER_BUFFER_SIZE,
+                        ),
                     ))
                     .file_name(format!("archive.{}", archive_format.extension()))
                     .mime_str("application/x-tar")
@@ -516,9 +519,12 @@ impl OutgoingServerTransfer {
                     "install-logs",
                     reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
                         tokio_util::io::ReaderStream::with_capacity(
-                            AsyncCountingReader::new_with_bytes_read(
-                                install_logs,
-                                Arc::clone(&bytes_archived),
+                            crate::io::bandwidth_reader::BandwidthReader::new_administrative(
+                                AsyncCountingReader::new_with_bytes_read(
+                                    install_logs,
+                                    Arc::clone(&bytes_archived),
+                                ),
+                                server.clone(),
                             ),
                             crate::TRANSFER_BUFFER_SIZE,
                         ),
@@ -537,9 +543,12 @@ impl OutgoingServerTransfer {
                         "diff-db",
                         reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
                             tokio_util::io::ReaderStream::with_capacity(
-                                AsyncCountingReader::new_with_bytes_read(
-                                    diff_db,
-                                    Arc::clone(&bytes_archived),
+                                crate::io::bandwidth_reader::BandwidthReader::new_administrative(
+                                    AsyncCountingReader::new_with_bytes_read(
+                                        diff_db,
+                                        Arc::clone(&bytes_archived),
+                                    ),
+                                    server.clone(),
                                 ),
                                 crate::TRANSFER_BUFFER_SIZE,
                             ),

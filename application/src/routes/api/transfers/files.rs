@@ -109,6 +109,11 @@ mod post {
         let subject = crate::routes::token::subject_uuid(&payload.base)?;
 
         let server = crate::routes::token::server(&state, subject).await?;
+        if server.bandwidth.blocked() {
+            return ApiResponse::error("bandwidth quota reached; remote copy is blocked")
+                .with_status(StatusCode::CONFLICT)
+                .ok();
+        }
 
         let total_bytes: u64 = headers
             .get("Total-Bytes")
@@ -175,10 +180,12 @@ mod post {
                                     Some("archive") => {
                                         archive_received = true;
                                         let file_name = field.file_name().unwrap_or("archive.tar.gz").to_string();
-                                        let reader =
+                                        let reader = crate::io::bandwidth_reader::BandwidthReader::new_administrative(
                                             tokio_util::io::StreamReader::new(field.into_stream().map_err(|err| {
                                                 std::io::Error::other(format!("failed to read multipart field: {err}"))
-                                            }));
+                                            })),
+                                            server.clone(),
+                                        );
                                         let reader = AbortReader::new(
                                             tokio_util::io::SyncIoBridge::new(reader),
                                             listener.clone(),

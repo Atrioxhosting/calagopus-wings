@@ -1590,7 +1590,37 @@ impl DockerProcessHandle {
 
         let stats_task = tokio::spawn(async move {
             if !publish_resource_usage {
-                return;
+                // Script runner containers have their own network boundary and
+                // may run beside the normal service. Meter them separately so
+                // their counters never replace or double-count service eth0.
+                let mut previous = (0u64, 0u64);
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+                loop {
+                    tick.tick().await;
+                    let mut stream = stats_docker.stats(
+                        &stats_id,
+                        Some(bollard::query_parameters::StatsOptions {
+                            stream: false,
+                            one_shot: true,
+                        }),
+                    );
+                    let Some(Ok(stats)) = stream.next().await else {
+                        continue;
+                    };
+                    let Some(network) = stats
+                        .networks
+                        .as_ref()
+                        .and_then(|networks| networks.get("eth0"))
+                    else {
+                        continue;
+                    };
+                    let (rx, tx) = (network.rx_bytes.unwrap_or(0), network.tx_bytes.unwrap_or(0));
+                    stats_server.bandwidth.record_stream(
+                        rx.saturating_sub(previous.0),
+                        tx.saturating_sub(previous.1),
+                    );
+                    previous = (rx, tx);
+                }
             }
 
             enum StatsSource {
@@ -1753,17 +1783,15 @@ impl DockerProcessHandle {
                                 .and_then(|memory| memory.limit)
                                 .unwrap_or(0),
                             network: stats.networks.as_ref().and_then(|networks| {
-                                let mut totals: Option<(u64, u64, u64, u64)> = None;
-
-                                for net in networks.values() {
-                                    let total = totals.get_or_insert((0, 0, 0, 0));
-                                    total.0 = total.0.saturating_add(net.rx_bytes.unwrap_or(0));
-                                    total.1 = total.1.saturating_add(net.rx_packets.unwrap_or(0));
-                                    total.2 = total.2.saturating_add(net.tx_bytes.unwrap_or(0));
-                                    total.3 = total.3.saturating_add(net.tx_packets.unwrap_or(0));
-                                }
-
-                                totals
+                                // Docker eth0 is the sole normal-container boundary.
+                                // Loopback is metered only at the Tundra source frontend.
+                                let net = networks.get("eth0")?;
+                                Some((
+                                    net.rx_bytes.unwrap_or(0),
+                                    net.rx_packets.unwrap_or(0),
+                                    net.tx_bytes.unwrap_or(0),
+                                    net.tx_packets.unwrap_or(0),
+                                ))
                             }),
                             cpu_total_ns: stats
                                 .cpu_stats

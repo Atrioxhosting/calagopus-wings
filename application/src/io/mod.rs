@@ -5,6 +5,7 @@ use std::{
 use tokio::io::AsyncWriteExt;
 
 pub mod abort;
+pub mod bandwidth_reader;
 pub mod compression;
 pub mod counting_reader;
 pub mod counting_writer;

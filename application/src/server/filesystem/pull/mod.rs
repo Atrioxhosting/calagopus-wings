@@ -151,6 +151,9 @@ impl Download {
         url: compact_str::CompactString,
         use_header: bool,
     ) -> Result<Self, anyhow::Error> {
+        if server.bandwidth.blocked() {
+            anyhow::bail!("bandwidth quota reached; cannot pull a file");
+        }
         let url = reqwest::Url::parse(&url).context("failed to parse download URL")?;
 
         if let Some(host) = url.host_str()
@@ -280,6 +283,10 @@ impl Download {
                         while let Some(chunk) =
                             response.chunk().await.map_err(|err| err.without_url())?
                         {
+                            server.bandwidth.record_stream(chunk.len() as u64, 0);
+                            if server.bandwidth.blocked() {
+                                anyhow::bail!("bandwidth quota reached during file pull");
+                            }
                             writer.write_all(&chunk).await?;
                             progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                         }

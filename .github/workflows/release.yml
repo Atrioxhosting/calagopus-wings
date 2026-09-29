@@ -75,6 +75,11 @@ jobs:
           target: ${{ matrix.target }}
           cache-key: ${{ matrix.target }}
 
+      - name: Verify release tag matches Wings version
+        run: |
+          MANIFEST_VERSION="$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name == "wings-rs") | .version')"
+          test "${GITHUB_REF_NAME#release-}" = "$MANIFEST_VERSION"
+
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --rev 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27 --locked
 
@@ -203,8 +208,13 @@ jobs:
           RAW_TAG="${{ github.ref_name }}"
           VERSION="${RAW_TAG#release-}"
 
+          MANIFEST_VERSION="$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name == "wings-rs") | .version')"
+          test "$VERSION" = "$MANIFEST_VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
           # Tag suffixes shared across both registries.
-          SUFFIXES=("${VERSION}")
+          # Docker tags cannot contain '+', so retain the exact version in the OCI label.
+          SUFFIXES=("${VERSION//+/_}")
 
           if [[ "$VERSION" == *-* ]]; then
             SUFFIXES+=("latest-pre")
@@ -232,6 +242,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64,linux/riscv64,linux/ppc64le
           push: true
+          build-args: |
+            WINGS_VERSION=${{ steps.prep_tags.outputs.version }}
           tags: ${{ env.DOCKER_TAGS }}
           sbom: true
           provenance: true

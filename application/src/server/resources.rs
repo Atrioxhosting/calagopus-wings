@@ -2,12 +2,41 @@ use super::state::ServerState;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+#[derive(ToSchema, Default, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BandwidthState {
+    #[default]
+    Active,
+    QuotaExceeded,
+    Stopping,
+    StoppedQuota,
+    RestorePending,
+    StopFailed,
+    EnforcementUnknown,
+}
+
+#[derive(ToSchema, Default, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandwidthUsage {
+    pub used_bytes: u64,
+    pub quota_bytes: Option<u64>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub period_start: i64,
+    pub period_end: i64,
+    pub bandwidth_per_gib: i64,
+    pub state: BandwidthState,
+    pub resume_after_quota: bool,
+    pub generation: u64,
+    pub last_checkpoint: i64,
+}
+
 nestify::nest! {
     #[derive(ToSchema, Default, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
     pub struct ResourceUsage {
         pub memory_bytes: u64,
         pub memory_limit_bytes: u64,
         pub disk_bytes: u64,
+        pub bandwidth: BandwidthUsage,
 
         pub state: ServerState,
 

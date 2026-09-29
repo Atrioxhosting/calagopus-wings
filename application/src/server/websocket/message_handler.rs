@@ -82,6 +82,13 @@ pub async fn handle_message(
                 .await;
         }
         WebsocketEvent::SendServerLogs => {
+            if server.bandwidth.blocked()
+                && !websocket_handler
+                    .has_permission(Permission::AdminWebsocketErrors)
+                    .await?
+            {
+                return Ok(());
+            }
             if server.state.get_state() != crate::server::state::ServerState::Offline
                 || state.config.load().api.send_offline_server_logs
             {
@@ -153,6 +160,13 @@ pub async fn handle_message(
             }
         }
         WebsocketEvent::SendCommand => {
+            if server.bandwidth.blocked()
+                && !websocket_handler
+                    .has_permission(Permission::AdminWebsocketErrors)
+                    .await?
+            {
+                return Ok(());
+            }
             let socket_jwt = websocket_handler.get_jwt().await?;
 
             if !socket_jwt
@@ -201,6 +215,13 @@ pub async fn handle_message(
         | WebsocketEvent::FileCollabAwareness
         | WebsocketEvent::FileCollabSave
         | WebsocketEvent::FileCollabReload => {
+            if server.bandwidth.blocked()
+                && !websocket_handler
+                    .has_permission(Permission::AdminWebsocketErrors)
+                    .await?
+            {
+                return Ok(());
+            }
             let Some(path) = message.args.first().cloned() else {
                 return Ok(());
             };

@@ -223,6 +223,16 @@ nestify::nest! {
         },
 
         pub suspended: bool,
+        #[serde(default)]
+        pub bandwidth_per_gib: i64,
+        #[serde(default)]
+        pub created: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        pub billing_period: Option<#[derive(ToSchema, Deserialize, Serialize, Clone)] pub struct ServerConfigurationBillingPeriod {
+            pub id: compact_str::CompactString,
+            pub start: chrono::DateTime<chrono::Utc>,
+            pub end: chrono::DateTime<chrono::Utc>,
+        }>,
         pub invocation: compact_str::CompactString,
         pub skip_egg_scripts: bool,
 
@@ -392,6 +402,9 @@ impl ServerConfiguration {
                 description: "This is an example server configuration.".into(),
             },
             suspended: false,
+            bandwidth_per_gib: 0,
+            created: None,
+            billing_period: None,
             invocation: "java -Xmx{{SERVER_MEMORY}}M -jar server.jar".into(),
             skip_egg_scripts: false,
             entrypoint: None,

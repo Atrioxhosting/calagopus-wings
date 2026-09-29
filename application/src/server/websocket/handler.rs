@@ -131,6 +131,15 @@ pub async fn handle_ws(
                         continue;
                     }
 
+                    let received_bytes = match &ws_data {
+                        Message::Text(text) => text.len() as u64,
+                        Message::Binary(binary) => binary.len() as u64,
+                        _ => 0,
+                    };
+                    if socket_jwt.read().await.is_some() {
+                        server.bandwidth.record_stream(received_bytes, 0);
+                    }
+
                     let jwt_result =
                         super::jwt::handle_jwt(&state, &server, &websocket_handler, ws_data).await;
                     if socket_jwt.read().await.is_some() {

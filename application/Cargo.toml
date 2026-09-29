@@ -1,14 +1,14 @@
 [package]
 name = "wings-rs"
 rust-version = { workspace = true }
-version = "1.2.3"
+version = "1.2.2+atriox.1"
 edition = "2024"
 
 [dependencies]
 tempfile = "3.27.0"
 unrar = { path = "../unrar-rs" }
 pbs-client = { path = "../pbs-client" }
-tundra-common = { git = "https://github.com/calagopus/tundra.git" }
+tundra-common = { path = "../vendor/tundra/tundra-common" }
 tracing = { version = "0.1.41", features = ["max_level_debug"] }
 tracing-subscriber = { version = "0.3.19", features = ["chrono"] }
 tracing-appender = "0.2.3"

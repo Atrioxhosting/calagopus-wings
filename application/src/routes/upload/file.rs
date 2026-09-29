@@ -61,6 +61,11 @@ async fn authenticate(
 ) -> Result<(FileJwtPayload, crate::server::Server), ApiResponse> {
     let payload: FileJwtPayload = crate::routes::token::verify(state, token, "file-upload")?;
     let server = crate::routes::token::server(state, payload.server_uuid).await?;
+    if server.bandwidth.blocked() {
+        return Err(
+            ApiResponse::error("bandwidth quota reached").with_status(StatusCode::FORBIDDEN)
+        );
+    }
 
     Ok((payload, server))
 }
@@ -370,6 +375,15 @@ mod post {
                     break;
                 };
 
+                if server.bandwidth.record_stream(chunk.len() as u64, 0) {
+                    server.reevaluate_bandwidth().await;
+                }
+                if server.bandwidth.blocked() {
+                    return ApiResponse::error("bandwidth quota reached")
+                        .with_status(StatusCode::FORBIDDEN)
+                        .ok();
+                }
+
                 let config = state.config.load();
                 if crate::unlikely(
                     config.api.upload_limit.as_bytes() != 0
@@ -666,6 +680,16 @@ mod patch {
             let chunk = chunk.map_err(|err| {
                 std::io::Error::other(format!("failed to read request body: {err}"))
             })?;
+
+            if server.bandwidth.record_stream(chunk.len() as u64, 0) {
+                server.reevaluate_bandwidth().await;
+            }
+            if server.bandwidth.blocked() {
+                file.shutdown().await?;
+                return ApiResponse::error("bandwidth quota reached")
+                    .with_status(StatusCode::FORBIDDEN)
+                    .ok();
+            }
 
             if crate::unlikely(
                 upload_limit != 0 && written_size + chunk.len() as u64 > upload_limit,

@@ -9,8 +9,10 @@ COPY --from=kopia /usr/local/bin/kopia /usr/bin/kopia
 
 # Add calagopus-wings and entrypoint
 ARG TARGETPLATFORM
+ARG WINGS_VERSION=unknown
 COPY .docker/${TARGETPLATFORM#linux/}/calagopus-wings /usr/bin/calagopus-wings
 
 ENV OCI_CONTAINER=official
+LABEL org.opencontainers.image.version=$WINGS_VERSION
 
 ENTRYPOINT ["/usr/bin/calagopus-wings"]
