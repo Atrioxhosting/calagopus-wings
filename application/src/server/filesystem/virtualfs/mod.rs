@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     sync::Semaphore,
 };
 
@@ -136,6 +136,50 @@ pub struct DirectoryListing {
     pub entries: Vec<DirectoryEntry>,
 }
 
+fn file_read_headers(size: u64, total_size: u64, reader_range: Option<ByteRange>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+
+    headers.insert(axum::http::header::CONTENT_LENGTH, size.into());
+
+    if let Some(reader_range) = &reader_range {
+        headers.insert(
+            axum::http::header::ACCEPT_RANGES,
+            HeaderValue::from_static("bytes"),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_RANGE,
+            reader_range.get_header_value(total_size),
+        );
+    }
+
+    headers
+}
+
+pub enum CheckedDirectoryListing {
+    Listing(DirectoryListing),
+    NotFound,
+    NotDirectory,
+}
+
+pub async fn read_dir_checked(
+    filesystem: &(impl VirtualReadableFilesystem + ?Sized),
+    path: &(dyn AsRef<Path> + Send + Sync),
+    per_page: Option<usize>,
+    page: usize,
+    is_ignored: IsIgnoredFn,
+    sort: crate::models::DirectorySortingMode,
+) -> Result<CheckedDirectoryListing, anyhow::Error> {
+    match filesystem.async_metadata(path).await {
+        Ok(metadata) if metadata.file_type.is_dir() => Ok(CheckedDirectoryListing::Listing(
+            filesystem
+                .async_read_dir(path, per_page, page, is_ignored, sort)
+                .await?,
+        )),
+        Ok(_) => Ok(CheckedDirectoryListing::NotDirectory),
+        Err(_) => Ok(CheckedDirectoryListing::NotFound),
+    }
+}
+
 pub struct FileRead {
     pub size: u64,
     pub total_size: u64,
@@ -167,6 +211,10 @@ impl FileRead {
                 reader: Box::new(file),
             })
         }
+    }
+
+    pub fn headers(&self) -> HeaderMap {
+        file_read_headers(self.size, self.total_size, self.reader_range)
     }
 }
 
@@ -203,23 +251,27 @@ impl AsyncFileRead {
         }
     }
 
-    pub fn headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-
-        headers.insert(axum::http::header::CONTENT_LENGTH, self.size.into());
-
-        if let Some(reader_range) = &self.reader_range {
-            headers.insert(
-                axum::http::header::ACCEPT_RANGES,
-                HeaderValue::from_static("bytes"),
-            );
-            headers.insert(
-                axum::http::header::CONTENT_RANGE,
-                reader_range.get_header_value(self.total_size),
-            );
+    /// Reads the whole file when it fits in `cap` bytes, both by its size up front
+    /// and by what is actually read.
+    pub async fn read_to_end_capped(
+        &mut self,
+        cap: u64,
+    ) -> Result<Option<Vec<u8>>, std::io::Error> {
+        if self.size > cap {
+            return Ok(None);
         }
 
-        headers
+        let mut buffer = Vec::with_capacity(self.size as usize);
+        (&mut self.reader)
+            .take(cap.saturating_add(1))
+            .read_to_end(&mut buffer)
+            .await?;
+
+        Ok((buffer.len() as u64 <= cap).then_some(buffer))
+    }
+
+    pub fn headers(&self) -> HeaderMap {
+        file_read_headers(self.size, self.total_size, self.reader_range)
     }
 }
 
@@ -564,6 +616,22 @@ pub trait AsyncDirectoryStreamWalk {
     }
 }
 
+/// Like [`VirtualReadableFilesystem::async_reachable_metadata`], but keeps `path` for
+/// a directory, which is copied under its own name so each entry is denylist-checked
+/// as it is walked.
+pub async fn resolve_copy_source(
+    filesystem: &(impl VirtualReadableFilesystem + ?Sized),
+    path: &(dyn AsRef<Path> + Send + Sync),
+) -> Result<(FileMetadata, PathBuf), anyhow::Error> {
+    let (metadata, resolved) = filesystem.async_reachable_metadata(path).await?;
+
+    if metadata.file_type.is_dir() {
+        Ok((metadata, path.as_ref().to_path_buf()))
+    } else {
+        Ok((metadata, resolved))
+    }
+}
+
 #[async_trait::async_trait]
 pub trait VirtualReadableFilesystem: Send + Sync {
     fn is_primary_server_fs(&self) -> bool {
@@ -594,6 +662,41 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<FileMetadata, anyhow::Error>;
+
+    fn resolve_reachable(
+        &self,
+        _file_type: FileType,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<PathBuf, anyhow::Error> {
+        Ok(path.as_ref().to_path_buf())
+    }
+    async fn async_resolve_reachable(
+        &self,
+        _file_type: FileType,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<PathBuf, anyhow::Error> {
+        Ok(path.as_ref().to_path_buf())
+    }
+    fn reachable_metadata(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<(FileMetadata, PathBuf), anyhow::Error> {
+        let metadata = self.metadata(path)?;
+        let resolved = self.resolve_reachable(metadata.file_type, path)?;
+
+        Ok((metadata, resolved))
+    }
+    async fn async_reachable_metadata(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<(FileMetadata, PathBuf), anyhow::Error> {
+        let metadata = self.async_metadata(path).await?;
+        let resolved = self
+            .async_resolve_reachable(metadata.file_type, path)
+            .await?;
+
+        Ok((metadata, resolved))
+    }
 
     async fn async_directory_entry(
         &self,
@@ -626,6 +729,16 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         is_ignored: IsIgnoredFn,
         sort: crate::models::DirectorySortingMode,
     ) -> Result<DirectoryListing, anyhow::Error>;
+    async fn async_read_dir_checked(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        per_page: Option<usize>,
+        page: usize,
+        is_ignored: IsIgnoredFn,
+        sort: crate::models::DirectorySortingMode,
+    ) -> Result<CheckedDirectoryListing, anyhow::Error> {
+        read_dir_checked(self, path, per_page, page, is_ignored, sort).await
+    }
     fn walk_dir<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),

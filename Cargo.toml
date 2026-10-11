@@ -3,7 +3,7 @@ resolver = "3"
 members = ["application", "pbs-client", "unrar-rs"]
 exclude = ["vendor/tundra"]
 default-members = ["application"]
-package.rust-version = "1.97.0"
+package.rust-version = "1.99.0"
 
 [workspace.dependencies]
 serde = { version = "1.0.138", features = ["derive"] }
@@ -47,6 +47,10 @@ opt-level = 3
 opt-level = 3
 
 [profile.release.package.zstd-sys]
+opt-level = 3
+
+# flate2 takes its gzip crc32 from zlib-rs, which runs at half speed when built for size
+[profile.release.package.zlib-rs]
 opt-level = 3
 
 [profile.release]

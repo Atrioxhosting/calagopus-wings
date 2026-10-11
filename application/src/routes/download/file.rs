@@ -5,10 +5,10 @@ mod get {
     use std::path::Path;
 
     use crate::{
-        io::fixed_reader::AsyncFixedReader,
+        io::fixed_reader::{AsyncFixedReader, FixedReader},
         response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::GetState,
-        server::filesystem::{cap::FileType, virtualfs::ByteRange},
+        server::filesystem::virtualfs::ByteRange,
     };
     use axum::{
         extract::Query,
@@ -77,7 +77,14 @@ mod get {
             .file_name()
             .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
 
-        let (root, filesystem) = server.filesystem.resolve_readable_fs(&server, parent).await;
+        let ignored = payload
+            .ignored_files
+            .request_ignored(&server, "file not found")?;
+
+        let (root, filesystem) = server
+            .filesystem
+            .resolve_readable_fs_ignoring(&server, parent, &ignored)
+            .await;
         let path = root.join(file_name);
 
         let metadata = match filesystem.async_metadata(&path).await {
@@ -97,44 +104,56 @@ mod get {
             }
         };
 
-        let ignored = match payload.ignored_files.compile() {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "failed to compile subuser ignored files, denying download: {:#?}",
-                    err
-                );
+        let range = ByteRange::from_headers(&headers);
+        let (mut headers, response) = if filesystem.is_fast() {
+            let file_read =
+                match tokio::task::spawn_blocking(move || filesystem.read_file(&path, range))
+                    .await
+                    .map_err(anyhow::Error::from)?
+                {
+                    Ok(file) => file,
+                    Err(_) => {
+                        return ApiResponse::error("file not found")
+                            .with_status(StatusCode::NOT_FOUND)
+                            .ok();
+                    }
+                };
 
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
+            (
+                file_read.headers(),
+                ApiResponse::new_read_stream(
+                    crate::io::bandwidth_reader::BandwidthReader::new(
+                        FixedReader::new_with_fixed_bytes(
+                            file_read.reader,
+                            file_read.size as usize,
+                        ),
+                        server.clone(),
+                    ),
+                    file_read.size,
+                ),
+            )
+        } else {
+            let file_read = match filesystem.async_read_file(&path, range).await {
+                Ok(file) => file,
+                Err(_) => {
+                    return ApiResponse::error("file not found")
+                        .with_status(StatusCode::NOT_FOUND)
+                        .ok();
+                }
+            };
+            let headers = file_read.headers();
+            let reader = crate::io::bandwidth_reader::BandwidthReader::new(
+                AsyncFixedReader::new_with_fixed_bytes(file_read.reader, file_read.size as usize),
+                server.clone(),
+            );
+
+            (
+                headers,
+                ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE),
+            )
         };
+        let is_range = headers.contains_key(axum::http::header::CONTENT_RANGE);
 
-        if filesystem.is_primary_server_fs()
-            && ignored
-                .as_ref()
-                .is_some_and(|o| o.is_ignored(&path, FileType::File))
-        {
-            return ApiResponse::error("file not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
-        let file_read = match filesystem
-            .async_read_file(&path, ByteRange::from_headers(&headers))
-            .await
-        {
-            Ok(file) => file,
-            Err(_) => {
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
-
-        let mut headers = file_read.headers();
         headers.insert(
             "Content-Disposition",
             format!(
@@ -158,20 +177,12 @@ mod get {
             headers.insert("Last-Modified", modified.to_rfc2822().parse()?);
         }
 
-        let reader = crate::io::bandwidth_reader::BandwidthReader::new(
-            AsyncFixedReader::new_with_fixed_bytes(file_read.reader, file_read.size as usize),
-            server.clone(),
-        );
+        let response = response.with_headers(headers);
 
-        if file_read.reader_range.is_some() {
-            ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE)
-                .with_headers(headers)
-                .with_status(StatusCode::PARTIAL_CONTENT)
-                .ok()
+        if is_range {
+            response.with_status(StatusCode::PARTIAL_CONTENT).ok()
         } else {
-            ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE)
-                .with_headers(headers)
-                .ok()
+            response.ok()
         }
     }
 }

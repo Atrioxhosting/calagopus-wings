@@ -1,7 +1,9 @@
 use super::State;
 use crate::{
     response::{ApiErrorExt, ApiResponse},
-    server::filesystem::{cap::FileType, uploads::part_path, virtualfs::VirtualWritableFilesystem},
+    server::filesystem::{
+        RequestIgnored, cap::FileType, uploads::part_path, virtualfs::VirtualWritableFilesystem,
+    },
 };
 use axum::{extract::DefaultBodyLimit, http::StatusCode};
 use serde::Deserialize;
@@ -79,30 +81,27 @@ struct UploadTarget {
     part: PathBuf,
 }
 
-/// Resolves the staging `.part` path of a resumable upload, rejecting targets
-/// hidden by the subuser's or the server's ignore lists.
 async fn resolve_target(
     server: &crate::server::Server,
     payload: &FileJwtPayload,
     directory: &str,
     file: &str,
-    action: &str,
 ) -> Result<UploadTarget, ApiResponse> {
-    let not_found = || ApiResponse::error("file not found").with_status(StatusCode::NOT_FOUND);
+    let ignored = payload
+        .ignored_files
+        .request_ignored(server, "file not found")?;
 
-    let ignored = match payload.ignored_files.compile() {
-        Ok(ignored) => ignored,
-        Err(err) => {
-            tracing::error!(
-                server = %server.uuid,
-                "failed to compile subuser ignored files, denying {action}: {:#?}",
-                err
-            );
+    resolve_upload_target(server, &ignored, directory, file).await
+}
 
-            return Err(not_found());
-        }
-    };
-
+/// Resolves the staging `.part` path of a resumable upload, rejecting targets
+/// hidden by the subuser's or the server's ignore lists.
+async fn resolve_upload_target(
+    server: &crate::server::Server,
+    ignored: &RequestIgnored,
+    directory: &str,
+    file: &str,
+) -> Result<UploadTarget, ApiResponse> {
     let relative = PathBuf::from(directory).join(file);
     let parent = relative
         .parent()
@@ -111,30 +110,18 @@ async fn resolve_target(
         .file_name()
         .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
 
-    if ignored
-        .as_ref()
-        .is_some_and(|o| o.is_ignored_subtree(parent, FileType::Dir))
-        || server
-            .filesystem
-            .async_is_ignored_subtree(parent, FileType::Dir)
-            .await
-    {
-        return Err(not_found());
-    }
-
-    let (root, filesystem) = server.filesystem.resolve_writable_fs(server, parent).await;
+    let (root, filesystem) = server
+        .filesystem
+        .resolve_writable_fs_ignoring(server, parent, ignored)
+        .await;
     let path = root.join(file_name);
 
     if filesystem.is_primary_server_fs()
-        && (ignored
-            .as_ref()
-            .is_some_and(|o| o.is_ignored(&path, FileType::File))
-            || server
-                .filesystem
-                .async_is_ignored(&path, FileType::File)
-                .await)
+        && ignored
+            .is_ignored_resolved(server, &path, FileType::File)
+            .await
     {
-        return Err(not_found());
+        return Err(ApiResponse::error("file not found").with_status(StatusCode::NOT_FOUND));
     }
 
     let part =
@@ -152,14 +139,11 @@ async fn resolve_target(
 
 mod post {
     use crate::{
-        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
+        response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
         server::{
             activity::{Activity, ActivityEvent},
-            filesystem::{
-                cap::FileType,
-                uploads::{NewUpload, part_path},
-            },
+            filesystem::{cap::FileType, uploads::NewUpload},
         },
     };
     use axum::{
@@ -251,20 +235,9 @@ mod post {
             }
         }
 
-        let ignored = match payload.ignored_files.compile() {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "failed to compile subuser ignored files, denying upload: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = payload
+            .ignored_files
+            .request_ignored(&server, "file not found")?;
 
         let directory = PathBuf::from(params.directory.as_str());
 
@@ -286,52 +259,16 @@ mod post {
                         .ok();
                 }
             };
-            let path = directory.join(&filename);
-            let parent = path
-                .parent()
-                .or_api_error(StatusCode::EXPECTATION_FAILED, "file has no parent")?;
-
-            if ignored
-                .as_ref()
-                .is_some_and(|o| o.is_ignored_subtree(parent, FileType::Dir))
-                || server
-                    .filesystem
-                    .async_is_ignored_subtree(parent, FileType::Dir)
-                    .await
-            {
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-
-            let file_name = path
-                .file_name()
-                .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
-
-            let (root, filesystem) = server
-                .filesystem
-                .resolve_writable_fs(&server, &parent)
-                .await;
-            let path = root.join(file_name);
-
-            if filesystem.is_primary_server_fs()
-                && (ignored
-                    .as_ref()
-                    .is_some_and(|o| o.is_ignored(&path, FileType::File))
-                    || server
-                        .filesystem
-                        .async_is_ignored(&path, FileType::File)
-                        .await)
-            {
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
+            let super::UploadTarget {
+                root,
+                filesystem,
+                path,
+                part,
+                ..
+            } = super::resolve_upload_target(&server, &ignored, &params.directory, &filename)
+                .await?;
 
             filesystem.async_create_dir_all(&root).await?;
-
-            let part = part_path(&path)
-                .or_api_error(StatusCode::EXPECTATION_FAILED, "file name too long")?;
 
             let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
             let _lock_guard = lock.lock().await;
@@ -465,8 +402,7 @@ mod head {
 
         let super::UploadTarget {
             filesystem, part, ..
-        } = super::resolve_target(&server, &payload, &params.directory, &params.file, "upload")
-            .await?;
+        } = super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
 
         let offset = match filesystem.async_metadata(&part).await {
             Ok(metadata) => {
@@ -602,8 +538,7 @@ mod patch {
             filesystem,
             path,
             part,
-        } = super::resolve_target(&server, &payload, &params.directory, &params.file, "upload")
-            .await?;
+        } = super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
 
         let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
         let _lock_guard = lock.lock().await;
@@ -789,14 +724,7 @@ mod delete {
 
         let super::UploadTarget {
             filesystem, part, ..
-        } = super::resolve_target(
-            &server,
-            &payload,
-            &params.directory,
-            &params.file,
-            "discard",
-        )
-        .await?;
+        } = super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
 
         let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
         let _lock_guard = lock.lock().await;

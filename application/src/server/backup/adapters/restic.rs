@@ -10,7 +10,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -1145,7 +1145,7 @@ impl BackupExt for ResticBackup {
                     let mut subtar = tar::Archive::new(child.into_stdout()?);
                     let entries = subtar.entries()?;
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     for entry in entries {
                         let mut entry = entry?;
                         let header = entry.header().clone();
@@ -1592,6 +1592,68 @@ impl BackupExt for ResticBackup {
             configuration: Arc::clone(&self.configuration),
             tree: Arc::new(tree),
         }))
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupTestExt for ResticBackup {
+    type Configuration = ResticBackupConfiguration;
+
+    async fn test(
+        state: &crate::routes::State,
+        configuration: Option<Self::Configuration>,
+    ) -> Result<(), anyhow::Error> {
+        let configuration = if tokio::fs::metadata(
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.backups.restic.password_file),
+        )
+        .await
+        .is_ok()
+        {
+            let config = state.config.load();
+
+            ResticBackupConfiguration {
+                repository: config
+                    .system
+                    .backups
+                    .restic
+                    .repository
+                    .as_str(&config)
+                    .into(),
+                password_file: Some(
+                    config
+                        .system
+                        .backups
+                        .restic
+                        .password_file
+                        .as_str(&config)
+                        .into(),
+                ),
+                retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
+                environment: config.system.backups.restic.environment.clone(),
+            }
+        } else {
+            configuration.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no restic configuration was provided and the node has no restic password file"
+                )
+            })?
+        };
+
+        let mut command = Command::new("restic");
+        command
+            .envs(&configuration.environment)
+            .arg("--repo")
+            .arg(&configuration.repository)
+            .arg("--no-cache")
+            .args(configuration.password())
+            .arg("cat")
+            .arg("config")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null());
+
+        super::probe_command(command).await
     }
 }
 
@@ -2348,7 +2410,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     let mut restic_tar = tar::Archive::new(child.take_stdout()?);
                     let entries = restic_tar.entries()?;
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     for entry in entries {
                         let mut entry = entry?;
                         let header = entry.header().clone();
@@ -2709,7 +2771,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
                     for resolved_entry in resolved {
                         match resolved_entry {

@@ -9,7 +9,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -477,7 +477,7 @@ impl BackupCreateExt for DdupBakBackup {
         let mut sha1 = sha1::Sha1::new();
         let mut file = tokio::fs::File::open(path).await?;
 
-        let mut buffer = vec![0; crate::BUFFER_SIZE];
+        let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
         loop {
             let bytes_read = file.read(&mut buffer).await?;
             if bytes_read == 0 {
@@ -594,7 +594,7 @@ impl BackupStreamCreateExt for DdupBakBackup {
         let mut sha1 = sha1::Sha1::new();
         let mut file = tokio::fs::File::open(path).await?;
 
-        let mut buffer = vec![0; crate::BUFFER_SIZE];
+        let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
         loop {
             let bytes_read = file.read(&mut buffer).await?;
             if bytes_read == 0 {
@@ -946,6 +946,18 @@ impl BackupExt for DdupBakBackup {
                 .map_or_else(|_| Default::default(), |dt| dt.into()),
             Some(get_repository(&server.app_state.config).await?),
         )))
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupTestExt for DdupBakBackup {
+    type Configuration = ();
+
+    async fn test(
+        state: &crate::routes::State,
+        _configuration: Option<Self::Configuration>,
+    ) -> Result<(), anyhow::Error> {
+        super::probe_backup_directory(&state.config).await
     }
 }
 

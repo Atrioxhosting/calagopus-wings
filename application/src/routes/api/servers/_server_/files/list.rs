@@ -8,10 +8,10 @@ mod get {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
         server::filesystem::{
+            RequestIgnored,
             cap::FileType,
-            ignore_list::IgnoreList,
             uploads::{UploadEntry, target_name},
-            virtualfs::IsIgnoredFn,
+            virtualfs::CheckedDirectoryListing,
         },
     };
     use axum::http::StatusCode;
@@ -49,7 +49,7 @@ mod get {
         server: &crate::server::Server,
         root: &Path,
         entries: &[crate::models::DirectoryEntry],
-        is_ignored: &IsIgnoredFn,
+        ignored: &RequestIgnored,
     ) -> Vec<UploadEntry> {
         let tracked = server
             .filesystem
@@ -61,11 +61,13 @@ mod get {
 
         let mut uploads = Vec::with_capacity(tracked.len());
         for upload in tracked {
-            if is_ignored
-                .call_async(FileType::File, root.join(upload.target_name.as_str()))
+            if !ignored
+                .is_ignored_resolved(
+                    server,
+                    &root.join(upload.target_name.as_str()),
+                    FileType::File,
+                )
                 .await
-                .keep()
-                .is_some()
             {
                 uploads.push(upload);
             }
@@ -130,59 +132,38 @@ mod get {
         };
         let page = data.page.unwrap_or(1);
 
-        let ignore = if data.ignored.is_empty() {
-            None
-        } else {
-            match IgnoreList::try_from_lines(data.ignored.iter()) {
-                Ok(ignore) => Some(ignore),
-                Err(err) => {
-                    tracing::error!(
-                        server = %server.uuid,
-                        "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                        err
-                    );
-
-                    return ApiResponse::error("directory not found")
-                        .with_status(StatusCode::NOT_FOUND)
-                        .ok();
-                }
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "directory not found")?;
 
         let (root, filesystem) = server
             .filesystem
-            .resolve_readable_fs(&server, Path::new(&data.root))
+            .resolve_readable_fs_ignoring(&server, Path::new(&data.root), &ignored)
             .await;
 
-        let metadata = filesystem.async_metadata(&root).await;
-        if let Ok(metadata) = metadata {
-            if !metadata.file_type.is_dir() {
-                return ApiResponse::error("path not a directory")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        } else {
-            return ApiResponse::error("path not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
-        let is_ignored: IsIgnoredFn = if filesystem.is_primary_server_fs()
-            && let Some(ignore) = ignore
-        {
-            server.filesystem.symlink_name_filter().merge(ignore.into())
-        } else if filesystem.is_primary_server_fs() {
+        let is_ignored = if filesystem.is_primary_server_fs() {
             server.filesystem.symlink_name_filter()
         } else {
             Default::default()
         };
 
-        let entries = filesystem
-            .async_read_dir(&root, per_page, page, is_ignored.clone(), data.sort)
-            .await?;
+        let entries = match filesystem
+            .async_read_dir_checked(&root, per_page, page, is_ignored, data.sort)
+            .await?
+        {
+            CheckedDirectoryListing::Listing(entries) => entries,
+            CheckedDirectoryListing::NotDirectory => {
+                return ApiResponse::error("path not a directory")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+            CheckedDirectoryListing::NotFound => {
+                return ApiResponse::error("path not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
 
         let uploads = if filesystem.is_primary_server_fs() {
-            upload_entries(&server, &root, &entries.entries, &is_ignored).await
+            upload_entries(&server, &root, &entries.entries, &ignored).await
         } else {
             Vec::new()
         };

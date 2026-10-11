@@ -13,7 +13,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
         },
         filesystem::{
             archive::{Archive, ArchiveFormat, StreamableArchiveFormat},
@@ -24,6 +24,7 @@ use crate::{
 };
 use compact_str::ToCompactString;
 use futures::TryStreamExt;
+use serde::Deserialize;
 use sha2::Digest;
 use std::{
     io::Write,
@@ -35,6 +36,7 @@ use std::{
     },
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use utoipa::ToSchema;
 
 static CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
 
@@ -239,7 +241,7 @@ impl S3Backup {
             let mut url_queue: std::collections::VecDeque<String> =
                 initial_urls.into_iter().collect();
             let mut part_number = 1;
-            let mut buffer = vec![0; crate::BUFFER_SIZE];
+            let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
             let (_upload_proxy, upload_http) =
                 Self::upload_client(config, url_queue.front().map(String::as_str)).await;
@@ -507,7 +509,7 @@ impl S3Backup {
         let checksum_task = async {
             let mut hasher = sha2::Sha256::new();
 
-            let mut buffer = vec![0; crate::BUFFER_SIZE];
+            let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
             loop {
                 let bytes_read = checksum_reader.read(&mut buffer).await?;
                 if crate::unlikely(bytes_read == 0) {
@@ -1020,7 +1022,7 @@ impl BackupExt for S3Backup {
             let mut last_parent = None;
             let entries = archive.entries()?;
 
-            let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
+            let mut read_buffer = crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
             for entry in entries {
                 let mut entry = entry?;
                 let path = server.filesystem.relative_path(&entry.path()?);
@@ -1129,6 +1131,47 @@ impl BackupExt for S3Backup {
         Err(anyhow::anyhow!(
             "this backup adapter does not support browsing files"
         ))
+    }
+}
+
+#[derive(ToSchema, Deserialize)]
+pub struct S3TestConfiguration {
+    upload_url: String,
+}
+
+#[async_trait::async_trait]
+impl BackupTestExt for S3Backup {
+    type Configuration = S3TestConfiguration;
+
+    async fn test(
+        state: &crate::routes::State,
+        configuration: Option<Self::Configuration>,
+    ) -> Result<(), anyhow::Error> {
+        const PROBE: &[u8] = b"calagopus backup configuration test";
+
+        let configuration = configuration
+            .ok_or_else(|| anyhow::anyhow!("no presigned s3 upload url was provided"))?;
+
+        let response = get_client(&state.config)
+            .put(&configuration.upload_url)
+            .header("Content-Length", PROBE.len())
+            .header("Content-Type", "application/gzip")
+            .body(PROBE)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to reach s3: {}", err.without_url()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+
+            return Err(anyhow::anyhow!(
+                "s3 rejected the test upload with {status}: {}",
+                body.trim()
+            ));
+        }
+
+        Ok(())
     }
 }
 

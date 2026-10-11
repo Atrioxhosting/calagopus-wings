@@ -987,7 +987,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         return Ok(true);
                     }
 
-                    let mut buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     loop {
                         match reader.read_uninterrupted(&mut buffer) {
                             Ok(0) => break,
@@ -1107,7 +1107,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                     let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     for (i, entry) in archive.files.iter().enumerate() {
                         let name = match Path::new(entry.name()).strip_prefix(&path) {
                             Ok(name) => name,
@@ -1487,16 +1487,7 @@ mod tests {
 
         let result = runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                let temp = tempfile::tempdir()?;
-                let state = crate::routes::AppState::mock();
-                state
-                    .config
-                    .mutate_in_place_for_testing()
-                    .system
-                    .data_directory =
-                    crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
-                let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
-                server.filesystem.disk_checker.abort();
+                let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
 
                 let first = vec![b'a'; crate::BUFFER_SIZE * 4];
                 let second = vec![b'b'; crate::BUFFER_SIZE * 4];

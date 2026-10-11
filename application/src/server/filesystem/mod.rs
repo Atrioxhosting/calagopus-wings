@@ -45,7 +45,8 @@ pub mod virtualfs;
 ///
 /// The panel checks the paths it was handed before calling, but it cannot see file
 /// types, symlink targets, or the entries inside a directory it names, so the list is
-/// applied again here.
+/// applied again here. The predicates also apply the server's own deny-list, so a
+/// route needs one check per path.
 #[derive(Default, Clone)]
 pub struct RequestIgnored(Option<IgnoreList>);
 
@@ -60,19 +61,116 @@ impl RequestIgnored {
         Ok(Self(Some(IgnoreList::try_from_lines(patterns)?)))
     }
 
+    pub fn from_list(list: IgnoreList) -> Self {
+        Self((!list.is_empty()).then_some(list))
+    }
+
     pub async fn is_ignored(
         &self,
         server: &crate::server::Server,
         path: &Path,
         file_type: cap::FileType,
     ) -> bool {
+        if server.filesystem.async_is_ignored(path, file_type).await {
+            return true;
+        }
+
         match &self.0 {
-            Some(matcher) => {
-                server
+            Some(matcher) => matcher.is_ignored(
+                &server.filesystem.async_ignore_path(path, file_type).await,
+                file_type,
+            ),
+            None => false,
+        }
+    }
+
+    /// Like [`Self::is_ignored`], but also checks the canonical
+    /// [`Filesystem::diff_key`], so a denied path cannot be reached through a
+    /// symlinked parent directory.
+    pub async fn is_ignored_resolved(
+        &self,
+        server: &crate::server::Server,
+        path: &Path,
+        file_type: cap::FileType,
+    ) -> bool {
+        if !self.applies(server) {
+            return false;
+        }
+
+        self.is_ignored(server, path, file_type).await
+            || self
+                .is_ignored(
+                    server,
+                    &server.filesystem.diff_key(path).await,
+                    cap::FileType::from_is_dir(file_type.is_dir()),
+                )
+                .await
+    }
+
+    /// Like [`Self::is_ignored_subtree`], but also checks the canonical
+    /// [`Filesystem::diff_key`].
+    pub async fn is_ignored_subtree_resolved(
+        &self,
+        server: &crate::server::Server,
+        path: &Path,
+    ) -> bool {
+        if !self.applies(server) {
+            return false;
+        }
+
+        self.is_ignored_subtree(server, path).await
+            || self
+                .is_ignored_subtree(server, &server.filesystem.diff_key(path).await)
+                .await
+    }
+
+    /// Like [`Self::is_ignored_resolved`], but resolves only the parent directories,
+    /// for operations that act on the entry rather than on what it links to.
+    pub async fn is_ignored_resolved_parent(
+        &self,
+        server: &crate::server::Server,
+        path: &Path,
+        file_type: cap::FileType,
+    ) -> bool {
+        if !self.applies(server) {
+            return false;
+        }
+
+        let file_type = cap::FileType::from_is_dir(file_type.is_dir());
+
+        self.is_ignored(server, path, file_type).await
+            || self
+                .is_ignored(
+                    server,
+                    &server.filesystem.async_canonicalize_parent(path).await,
+                    file_type,
+                )
+                .await
+    }
+
+    fn applies(&self, server: &crate::server::Server) -> bool {
+        self.0.is_some() || !server.filesystem.disk_ignored.load().is_empty()
+    }
+
+    /// Like [`Self::is_ignored`] for a directory, but false when the list only
+    /// excludes it while re-including something beneath it.
+    async fn is_ignored_subtree(&self, server: &crate::server::Server, path: &Path) -> bool {
+        if server
+            .filesystem
+            .async_is_ignored_subtree(path, cap::FileType::Dir)
+            .await
+        {
+            return true;
+        }
+
+        match &self.0 {
+            Some(matcher) => matcher.is_ignored_subtree(
+                &server
                     .filesystem
-                    .async_is_subuser_ignored(matcher, path, file_type)
-                    .await
-            }
+                    .async_ignore_path(path, cap::FileType::Dir)
+                    .await,
+                cap::FileType::Dir,
+            ),
             None => false,
         }
     }
@@ -313,6 +411,10 @@ impl Filesystem {
         IsIgnoredFn::new(
             move |file_type, path: PathBuf| {
                 let matcher = sync_server.filesystem.disk_ignored.load();
+                if matcher.is_empty() {
+                    return IgnoreVerdict::Keep(path);
+                }
+
                 let match_path = sync_server.filesystem.rematched(&path, file_type);
 
                 Self::judge(&matcher, file_type, match_path, path)
@@ -322,6 +424,10 @@ impl Filesystem {
 
                 async move {
                     let matcher = server.filesystem.disk_ignored.load();
+                    if matcher.is_empty() {
+                        return IgnoreVerdict::Keep(path);
+                    }
+
                     let match_path = server.filesystem.async_rematched(&path, file_type).await;
 
                     Self::judge(&matcher, file_type, match_path, path)
@@ -399,15 +505,6 @@ impl Filesystem {
         self.disk_ignored
             .load()
             .is_ignored_subtree(&path, file_type)
-    }
-
-    pub async fn async_is_subuser_ignored(
-        &self,
-        matcher: &IgnoreList,
-        path: &Path,
-        file_type: cap::FileType,
-    ) -> bool {
-        matcher.is_ignored(&self.async_ignore_path(path, file_type).await, file_type)
     }
 
     fn ignore_path<'a>(&self, path: &'a Path, file_type: cap::FileType) -> Cow<'a, Path> {
@@ -562,7 +659,6 @@ impl Filesystem {
         path: &Path,
         ignored: &RequestIgnored,
     ) -> (PathBuf, Arc<dyn VirtualReadableFilesystem>) {
-        let ignored = ignored.filter(server);
         let path = self.relative_path(path);
 
         'backupfs: {
@@ -632,8 +728,8 @@ impl Filesystem {
                 break 'archivefs;
             }
 
-            if self
-                .async_is_ignored(&archive_path, cap::FileType::File)
+            if ignored
+                .is_ignored_resolved(server, &archive_path, cap::FileType::File)
                 .await
             {
                 break 'archivefs;
@@ -643,6 +739,7 @@ impl Filesystem {
                 Ok(p) => p,
                 Err(_) => break 'archivefs,
             };
+            let archive_path = self.diff_key(&archive_path).await;
 
             if self
                 .async_metadata(&archive_path)
@@ -786,7 +883,7 @@ impl Filesystem {
         fs.is_primary_server_fs = true;
         fs.is_writable = true;
         let mut fs = fs.with_is_ignored(Self::deny_filter(server));
-        if let Some(ignored) = ignored.clone() {
+        if let Some(ignored) = ignored.filter(server) {
             fs = fs.with_is_ignored(ignored);
         }
 
@@ -1207,7 +1304,7 @@ impl Filesystem {
             if !ignorant && self.disk_limit() != 0 {
                 let limit = self.disk_limit() as u64;
 
-                let result = self.disk_usage_cached_physical.fetch_update(
+                let result = self.disk_usage_cached_physical.try_update(
                     Ordering::SeqCst,
                     Ordering::Relaxed,
                     |current| {
@@ -1234,7 +1331,7 @@ impl Filesystem {
         } else if delta.physical < 0 {
             let abs = delta.physical.unsigned_abs();
             self.disk_usage_cached_physical
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(current.saturating_sub(abs))
                 })
                 .ok();
@@ -1246,7 +1343,7 @@ impl Filesystem {
         } else if delta.logical < 0 {
             let abs = delta.logical.unsigned_abs();
             self.disk_usage_cached_logical
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(current.saturating_sub(abs))
                 })
                 .ok();
@@ -1367,37 +1464,16 @@ impl Filesystem {
         cap_filesystem: &cap::CapFilesystem,
         path: impl AsRef<Path>,
     ) -> Result<(), std::io::Error> {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
-            use std::os::fd::AsFd;
-
             let cfg = config.load();
             let owner_uid = rustix::fs::Uid::from_raw_unchecked(cfg.system.user.uid);
             let owner_gid = rustix::fs::Gid::from_raw_unchecked(cfg.system.user.gid);
             drop(cfg);
 
-            if path.as_ref() == Path::new("")
-                || path.as_ref() == Path::new(".")
-                || path.as_ref() == Path::new("/")
-            {
-                std::os::unix::fs::chown(
-                    &cap_filesystem.base_path,
-                    Some(owner_uid.as_raw()),
-                    Some(owner_gid.as_raw()),
-                )?;
-            } else {
-                rustix::fs::chownat(
-                    cap_filesystem.get_inner()?.as_fd(),
-                    cap_filesystem.relative_path(path.as_ref()),
-                    Some(owner_uid),
-                    Some(owner_gid),
-                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-                )?;
-            }
-
-            Ok(())
+            cap_filesystem.lchown(path, owner_uid, owner_gid)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
             Ok(())
         }
@@ -1461,41 +1537,18 @@ impl Filesystem {
             return Ok(());
         }
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
-            use std::os::fd::AsFd;
-
             let owner_uid = rustix::fs::Uid::from_raw_unchecked(self.config.load().system.user.uid);
             let owner_gid = rustix::fs::Gid::from_raw_unchecked(self.config.load().system.user.gid);
 
-            tokio::task::spawn_blocking({
-                let cap_filesystem = self.cap_filesystem.clone();
-                let path = self.relative_path(path.as_ref());
-                let base_path = self.base_path.clone();
-
-                move || {
-                    if path == Path::new("") || path == Path::new(".") || path == Path::new("/") {
-                        std::os::unix::fs::chown(
-                            &base_path,
-                            Some(owner_uid.as_raw()),
-                            Some(owner_gid.as_raw()),
-                        )
-                    } else {
-                        Ok(rustix::fs::chownat(
-                            cap_filesystem.get_inner()?.as_fd(),
-                            path,
-                            Some(owner_uid),
-                            Some(owner_gid),
-                            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-                        )?)
-                    }
-                }
-            })
-            .await
-            .map_err(std::io::Error::other)
-            .and_then(|result| self.absorb_chown_refusal(result))
+            self.absorb_chown_refusal(
+                self.cap_filesystem
+                    .async_lchown(path, owner_uid, owner_gid)
+                    .await,
+            )
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
             Ok(())
         }
@@ -1509,7 +1562,7 @@ impl Filesystem {
             return Ok(());
         }
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsFd;
 
@@ -1518,36 +1571,11 @@ impl Filesystem {
             let owner_gid = rustix::fs::Gid::from_raw_unchecked(self.config.load().system.user.gid);
             let root_rel = self.relative_path(path.as_ref());
 
-            tokio::task::spawn_blocking({
-                let cap_filesystem = self.cap_filesystem.clone();
-                let base_path = self.base_path.clone();
-                let root_rel = root_rel.clone();
-
-                move || -> Result<(), std::io::Error> {
-                    if root_rel.as_os_str().is_empty()
-                        || root_rel == Path::new(".")
-                        || root_rel == Path::new("/")
-                    {
-                        std::os::unix::fs::chown(
-                            &base_path,
-                            Some(owner_uid.as_raw()),
-                            Some(owner_gid.as_raw()),
-                        )?;
-                    } else {
-                        rustix::fs::chownat(
-                            cap_filesystem.get_inner()?.as_fd(),
-                            &root_rel,
-                            Some(owner_uid),
-                            Some(owner_gid),
-                            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-                        )?;
-                    }
-
-                    Ok(())
-                }
-            })
-            .await
-            .map(|result| self.absorb_chown_refusal(result))??;
+            self.absorb_chown_refusal(
+                self.cap_filesystem
+                    .async_lchown(&root_rel, owner_uid, owner_gid)
+                    .await,
+            )?;
 
             if !metadata.is_dir() || self.chown_refused.load(Ordering::Relaxed) {
                 return Ok(());
@@ -1563,12 +1591,9 @@ impl Filesystem {
 
                     let func = std::sync::Arc::new(
                         move |entry: crate::server::filesystem::cap::WalkEntry| {
-                            let fd = inner.as_fd();
-                            let path = entry.path;
-
                             let Ok(stat) = rustix::fs::statx(
-                                fd,
-                                &path,
+                                inner.as_fd(),
+                                &entry.path,
                                 rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
                                 rustix::fs::StatxFlags::UID | rustix::fs::StatxFlags::GID,
                             ) else {
@@ -1581,14 +1606,7 @@ impl Filesystem {
                                 return Ok(());
                             }
 
-                            rustix::fs::chownat(
-                                fd,
-                                &path,
-                                Some(owner_uid),
-                                Some(owner_gid),
-                                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-                            )
-                            .ok();
+                            entry.lchown(owner_uid, owner_gid).ok();
 
                             Ok(())
                         },
@@ -1603,7 +1621,7 @@ impl Filesystem {
 
             Ok(())
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
             let _ = path;
             Ok(())
@@ -2086,7 +2104,7 @@ impl Filesystem {
             metadata,
             symlink_destination,
             symlink_destination_metadata,
-            directory_entry: None,
+            parent: None,
         }
     }
 
@@ -2117,7 +2135,7 @@ impl Filesystem {
             metadata,
             symlink_destination,
             symlink_destination_metadata,
-            directory_entry: None,
+            parent: None,
         }
     }
 
@@ -2255,14 +2273,14 @@ pub struct PreparedDirectoryEntry {
     pub metadata: Metadata,
     pub symlink_destination: Option<PathBuf>,
     pub symlink_destination_metadata: Option<Metadata>,
-    directory_entry: Option<cap_std::fs::DirEntry>,
+    parent: Option<Arc<cap::ListingDir>>,
 }
 
 impl PreparedDirectoryEntry {
     fn open(&self, filesystem: &cap::CapFilesystem) -> std::io::Result<std::fs::File> {
-        match &self.directory_entry {
-            Some(entry) => entry.open().map(cap_std::fs::File::into_std),
-            None => filesystem.open(self.symlink_destination.as_ref().unwrap_or(&self.path)),
+        match (&self.parent, self.path.file_name()) {
+            (Some(parent), Some(name)) => parent.open(name),
+            _ => filesystem.open(self.symlink_destination.as_ref().unwrap_or(&self.path)),
         }
     }
 
@@ -2381,7 +2399,7 @@ mod tests {
                     metadata: metadata.clone(),
                     symlink_destination: None,
                     symlink_destination_metadata: None,
-                    directory_entry: None,
+                    parent: None,
                 };
 
                 let (cache, start, opens, release, started, filesystem) =
@@ -2483,23 +2501,8 @@ mod tests {
 
     impl CopyFixture {
         async fn new() -> Result<Self, anyhow::Error> {
-            let temp = tempfile::tempdir()?;
-            let state = crate::routes::AppState::mock();
-            state
-                .config
-                .mutate_in_place_for_testing()
-                .system
-                .data_directory =
-                crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
-
-            let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
-            server.filesystem.disk_checker.abort();
-
+            let (temp, server) = crate::server::Server::mock_in_tempdir().await;
             let root = server.filesystem.base_path.to_path_buf();
-            std::fs::create_dir_all(&root)?;
-
-            let cap = cap::CapFilesystem::new(&root).await?;
-            server.filesystem.inner.store(Some(cap.get_inner()?));
 
             Ok(Self {
                 server,
