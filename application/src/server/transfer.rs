@@ -691,8 +691,8 @@ impl OutgoingServerTransfer {
                         let formatted_bytes_archived = human_bytes(current_bytes_archived as f64);
                         let formatted_bytes_total = human_bytes(bytes_total as f64);
                         let formatted_archive_rate = human_bytes(archive_rate);
-                        let formatted_bytes_sent = human_bytes(current_bytes_sent as f64);
-                        let formatted_network_rate = human_bytes(network_rate);
+                        let formatted_bytes_sent = crate::network_format::bytes(current_bytes_sent as f64);
+                        let formatted_network_rate = crate::network_format::rate(network_rate);
 
                         let archive_percentage = (current_bytes_archived as f64 / bytes_total as f64) * 100.0;
                         let formatted_archive_percentage = format!("{:.2}%", archive_percentage);
@@ -743,7 +743,7 @@ impl OutgoingServerTransfer {
                         };
 
                         let progress_log = format!(
-                            "{} - ETA: {}\r\nArchive: {} of {} ({}/s) - {} files - Elapsed: {}\r\nNetwork: {} sent ({}/s)",
+                            "{} - ETA: {}\r\nArchive: {} of {} ({}/s) - {} files - Elapsed: {}\r\nNetwork: {} sent ({})",
                             crate::utils::draw_progress_bar(30, current_bytes_archived as f64, bytes_total as f64),
                             time_estimate,
                             formatted_bytes_archived,
@@ -775,7 +775,7 @@ impl OutgoingServerTransfer {
 
                         tracing::debug!(
                             server = %server.uuid,
-                            "Progress: {}, Archive: {} of {} ({}/s, {} files), Network: {} ({}/s), ETA: {}",
+                            "Progress: {}, Archive: {} of {} ({}/s, {} files), Network: {} ({}), ETA: {}",
                             formatted_archive_percentage,
                             formatted_bytes_archived,
                             formatted_bytes_total,

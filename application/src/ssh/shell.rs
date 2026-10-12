@@ -183,12 +183,12 @@ impl ShellSession {
                 writeln("  Network Usage:").await;
                 writeln(&format!(
                     "    Received: {}",
-                    human_bytes::human_bytes(resource_usage.network.rx_bytes as f64)
+                    crate::network_format::bytes(resource_usage.network.rx_bytes as f64)
                 ))
                 .await;
                 writeln(&format!(
                     "    Sent: {}",
-                    human_bytes::human_bytes(resource_usage.network.tx_bytes as f64)
+                    crate::network_format::bytes(resource_usage.network.tx_bytes as f64)
                 ))
                 .await;
             }
