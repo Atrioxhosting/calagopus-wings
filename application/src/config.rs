@@ -1546,6 +1546,17 @@ pub struct ConfigGuard(
     tracing_appender::non_blocking::WorkerGuard,
 );
 
+impl InnerConfig {
+    /// Rebrand the legacy display name without changing config or service labels.
+    pub fn display_name(&self) -> &str {
+        if self.app_name.trim().eq_ignore_ascii_case("Calagopus") {
+            "Atrioxhosting"
+        } else {
+            &self.app_name
+        }
+    }
+}
+
 pub type ConfigSnapshot = arc_swap::Guard<Arc<InnerConfig>>;
 type ReloadHandle =
     tracing_subscriber::reload::Handle<Targets, Layered<LevelFilter, tracing_subscriber::Registry>>;
@@ -2303,7 +2314,7 @@ impl Config {
     pub fn daemon_prelude(&self) -> compact_str::CompactString {
         nu_ansi_term::Color::Yellow
             .bold()
-            .paint(format!("[{} Daemon]:", self.load().app_name))
+            .paint("[Atrioxhosting Daemon]")
             .to_compact_string()
     }
 
@@ -2529,6 +2540,29 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn branding_does_not_rewrite_existing_configuration() {
+        let config = Config::mock();
+        for name in ["Calagopus", "CALAGOPUS", "Custom hosting"] {
+            config.mutate_in_place_for_testing().app_name = name.into();
+            let before = serde_json::to_value(&*config.load()).unwrap();
+            assert_eq!(
+                config.daemon_prelude(),
+                "\u{1b}[1;33m[Atrioxhosting Daemon]\u{1b}[0m"
+            );
+            assert_eq!(serde_json::to_value(&*config.load()).unwrap(), before);
+            assert_eq!(config.load().app_name, name);
+            assert_eq!(
+                config.load().display_name(),
+                if name.eq_ignore_ascii_case("Calagopus") {
+                    "Atrioxhosting"
+                } else {
+                    name
+                }
+            );
+        }
+    }
 
     fn from_yaml(yaml: &str) -> InnerConfig {
         serde_norway::from_str(yaml).expect("failed to parse config")

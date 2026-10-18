@@ -931,7 +931,7 @@ impl BackupExt for PbsBackup {
     async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
         if !pbs_client::naming::is_calagopus_id(self.config.id_prefix(), &self.backup_id) {
             return Err(anyhow::anyhow!(
-                "refusing to delete PBS snapshot with non-Calagopus backup-id '{}'",
+                "refusing to delete PBS snapshot with non-Atrioxhosting backup-id '{}'",
                 self.backup_id
             ));
         }

@@ -725,7 +725,7 @@ async fn main_rt() {
     let (mut router, mut openapi) = app.split_for_parts();
     openapi.info.version = "1.0.0".into();
     openapi.info.description = None;
-    openapi.info.title = format!("{} Wings API", config.load().app_name);
+    openapi.info.title = format!("{} Wings API", config.load().display_name());
     openapi.info.contact = None;
     openapi.info.license = None;
     if let Some(components) = openapi.components.as_mut() {

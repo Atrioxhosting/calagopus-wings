@@ -506,7 +506,7 @@ impl ShellSession {
                 .write_all(
                     format!(
                         "\x1b]0;{} - {}\x07",
-                        self.state.config.load().app_name,
+                        self.state.config.load().display_name(),
                         self.server.configuration.read().await.meta.name
                     )
                     .as_bytes(),

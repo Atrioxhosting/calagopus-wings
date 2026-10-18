@@ -47,7 +47,7 @@ fn lxcfs_args() -> String {
 fn generate_systemd_service(binary_path: &Path) -> String {
     format!(
         r#"[Unit]
-Description=Calagopus Wings Daemon
+Description=Atrioxhosting Wings Daemon
 After=docker.service
 Requires=docker.service
 PartOf=docker.service
@@ -73,7 +73,7 @@ WantedBy=multi-user.target
 fn generate_systemd_lxcfs_service(lxcfs_path: &Path) -> String {
     format!(
         r#"[Unit]
-Description=Calagopus Wings LXCFS
+Description=Atrioxhosting Wings LXCFS
 Before=docker.service
 
 [Service]
@@ -98,7 +98,7 @@ fn generate_openrc_service(binary_path: &Path) -> String {
     format!(
         r#"#!/sbin/openrc-run
 
-description="Calagopus Wings Daemon"
+description="Atrioxhosting Wings Daemon"
 
 command="{}"
 supervisor="supervise-daemon"
@@ -121,7 +121,7 @@ fn generate_openrc_lxcfs_service(lxcfs_path: &Path) -> String {
     format!(
         r#"#!/sbin/openrc-run
 
-description="Calagopus Wings LXCFS"
+description="Atrioxhosting Wings LXCFS"
 
 command="{}"
 command_args="{}"

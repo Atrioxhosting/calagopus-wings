@@ -79,7 +79,7 @@ async fn index() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         format!(
-            "calagopus wings {} is waiting to be paired.\nadd this node in your panel and enter the pairing code printed in the wings logs.\n",
+            "Atrioxhosting Wings {} is waiting to be paired.\nadd this node in your panel and enter the pairing code printed in the wings logs.\n",
             crate::VERSION
         ),
     )
