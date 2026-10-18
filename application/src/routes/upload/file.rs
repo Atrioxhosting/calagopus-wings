@@ -221,11 +221,11 @@ mod post {
             }
             drop(config);
 
-            let disk_limit = server.filesystem.disk_limit();
-            if disk_limit > 0
-                && total_size
-                    > (disk_limit as u64)
-                        .saturating_sub(server.filesystem.get_physical_cached_size())
+            if !server
+                .filesystem
+                .trash
+                .ensure_headroom(&server, i64::try_from(total_size).unwrap_or(i64::MAX))
+                .await
             {
                 return ApiResponse::error(
                     "file size is larger than the server's available disk space",
@@ -516,19 +516,17 @@ mod patch {
 
         if upload_offset == 0
             && let Some(total_size) = upload_length
+            && !server
+                .filesystem
+                .trash
+                .ensure_headroom(&server, i64::try_from(total_size).unwrap_or(i64::MAX))
+                .await
         {
-            let disk_limit = server.filesystem.disk_limit();
-            if disk_limit > 0
-                && total_size
-                    > (disk_limit as u64)
-                        .saturating_sub(server.filesystem.get_physical_cached_size())
-            {
-                return ApiResponse::error(
-                    "file size is larger than the server's available disk space",
-                )
-                .with_status(StatusCode::EXPECTATION_FAILED)
-                .ok();
-            }
+            return ApiResponse::error(
+                "file size is larger than the server's available disk space",
+            )
+            .with_status(StatusCode::EXPECTATION_FAILED)
+            .ok();
         }
 
         let super::UploadTarget {

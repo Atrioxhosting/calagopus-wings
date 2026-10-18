@@ -451,6 +451,27 @@ impl CapFilesystem {
         }
     }
 
+    /// Clears the immutable and append-only inode flags on `path`, which block a
+    /// rename just as they block an unlink.
+    pub async fn async_clear_inode_flags(
+        &self,
+        path: impl AsRef<Path>,
+        file_type: FileType,
+    ) -> Result<(), std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+
+        #[cfg(target_os = "linux")]
+        {
+            let inner = self.get_inner()?;
+            tokio::task::spawn_blocking(move || Self::clear_inode_flags(&inner, &path, file_type))
+                .await??;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (path, file_type);
+
+        Ok(())
+    }
+
     pub async fn async_remove_file(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
 

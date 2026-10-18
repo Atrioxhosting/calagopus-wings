@@ -710,7 +710,7 @@ impl BackupExt for KopiaBackup {
                         let mode = header.mode().unwrap_or(if is_dir { 0o755 } else { 0o644 });
                         let size = header.size().unwrap_or(0);
 
-                        let mut options: zip::write::FileOptions<'_, ()> =
+                        let mut options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),
@@ -1907,7 +1907,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                                 .unwrap_or(if file_type.is_dir() { 0o755 } else { 0o644 });
                         let size = header.size().unwrap_or(0);
 
-                        let mut options: zip::write::FileOptions<'_, ()> =
+                        let mut options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),

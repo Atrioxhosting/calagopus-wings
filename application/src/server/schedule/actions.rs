@@ -6,6 +6,7 @@ use crate::{
             RenameParents,
             archive::ArchiveFormat,
             cap::FileType,
+            trash::TrashSource,
             virtualfs::{AsyncWritableFileStream, IsIgnoredFn},
         },
     },
@@ -302,6 +303,8 @@ pub enum ScheduleAction {
     DeleteFiles {
         #[serde(default)]
         ignore_failure: bool,
+        #[serde(default)]
+        trash: bool,
 
         root: ScheduleDynamicParameter,
         files: Vec<compact_str::CompactString>,
@@ -1507,13 +1510,17 @@ impl ScheduleAction {
                     timestamp: chrono::Utc::now(),
                 });
             }
-            ScheduleAction::DeleteFiles { root, files, .. } => {
+            ScheduleAction::DeleteFiles {
+                trash, root, files, ..
+            } => {
                 let raw_root = match execution_context.resolve_parameter(root) {
                     Some(root) => root,
                     None => {
                         return Err("unable to resolve parameter `root` into a string.".into());
                     }
                 };
+
+                let trash = *trash && server.filesystem.trash.is_enabled();
 
                 for file in files {
                     let (source, filesystem) = server
@@ -1530,7 +1537,16 @@ impl ScheduleAction {
                     };
 
                     let result = if filesystem.is_primary_server_fs() {
-                        server.filesystem.truncate_path(&source).await
+                        if trash {
+                            server
+                                .filesystem
+                                .trash
+                                .trash(server, &source, TrashSource::Schedule)
+                                .await
+                                .map(drop)
+                        } else {
+                            server.filesystem.truncate_path(&source).await
+                        }
                     } else if metadata.file_type.is_dir() {
                         filesystem.async_remove_dir_all(&source).await
                     } else {
@@ -1550,7 +1566,11 @@ impl ScheduleAction {
                 }
 
                 server.activity.log_activity(Activity {
-                    event: ActivityEvent::FileDelete,
+                    event: if trash {
+                        ActivityEvent::FileTrash
+                    } else {
+                        ActivityEvent::FileDelete
+                    },
                     user: None,
                     ip: None,
                     metadata: Some(serde_json::json!({

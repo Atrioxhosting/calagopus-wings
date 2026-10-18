@@ -5,6 +5,8 @@ use utoipa_axum::{
     routes,
 };
 
+mod stat;
+
 mod post {
     use crate::{
         io::{
@@ -475,5 +477,6 @@ mod post {
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .routes(routes!(post::route).layer(DefaultBodyLimit::disable()))
+        .nest("/stat", stat::router(state))
         .with_state(state.clone())
 }

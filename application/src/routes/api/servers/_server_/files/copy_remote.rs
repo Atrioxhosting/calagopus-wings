@@ -54,16 +54,87 @@ mod post {
         #[serde(default)]
         destination_ignored: Vec<compact_str::CompactString>,
 
+        #[serde(default)]
+        overwrite: bool,
         #[serde(default = "foreground")]
         foreground: bool,
     }
 
     #[derive(ToSchema, Serialize)]
-    pub struct Response {}
+    pub struct Response {
+        #[schema(value_type = Vec<crate::models::DirectoryEntry>)]
+        skipped: Vec<serde_json::Value>,
+    }
 
     #[derive(ToSchema, Serialize)]
     pub struct ResponseAccepted {
         identifier: uuid::Uuid,
+        #[schema(value_type = Vec<crate::models::DirectoryEntry>)]
+        skipped: Vec<serde_json::Value>,
+    }
+
+    async fn existing_local(
+        state: &crate::routes::AppState,
+        data: &Payload,
+        destination_ignored: &crate::server::filesystem::RequestIgnored,
+    ) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+        let Some(destination_server) = state
+            .server_manager
+            .get_server(data.destination_server)
+            .await
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut existing = Vec::new();
+        for file in &data.files {
+            let to = Path::new(&data.destination_path).join(&file.to);
+            let (Some(to_parent), Some(to_file_name)) = (to.parent(), to.file_name()) else {
+                continue;
+            };
+
+            let (destination_root, destination_filesystem) = destination_server
+                .filesystem
+                .resolve_writable_fs_ignoring(&destination_server, to_parent, destination_ignored)
+                .await;
+
+            if let Ok(mut entry) = destination_filesystem
+                .async_directory_entry(&destination_root.join(to_file_name))
+                .await
+            {
+                entry.name = file.to.clone();
+                existing.push(serde_json::to_value(entry)?);
+            }
+        }
+
+        Ok(existing)
+    }
+
+    async fn existing_remote(data: &Payload) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+        #[derive(Deserialize)]
+        struct StatResponse {
+            entries: Vec<serde_json::Value>,
+        }
+
+        let response = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()?
+            .post(format!("{}/stat", data.url.trim_end_matches('/')))
+            .header("Authorization", &data.token)
+            .json(&serde_json::json!({
+                "files": data.files.iter().map(|file| &file.to).collect::<Vec<_>>(),
+            }))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "remote server could not check for existing files (status: {})",
+                response.status()
+            ));
+        }
+
+        Ok(response.json::<StatResponse>().await?.entries)
     }
 
     #[utoipa::path(post, path = "/", responses(
@@ -81,7 +152,7 @@ mod post {
     pub async fn route(
         state: GetState,
         server: GetServer,
-        crate::Payload(data): crate::Payload<Payload>,
+        crate::Payload(mut data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
         let source_ignored =
             crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
@@ -108,6 +179,41 @@ mod post {
             return ApiResponse::error("path not found")
                 .with_status(StatusCode::NOT_FOUND)
                 .ok();
+        }
+
+        let mut skipped = Vec::new();
+        if !data.overwrite {
+            let existing = if data.url.is_empty() {
+                existing_local(&state, &data, &destination_ignored).await
+            } else {
+                existing_remote(&data).await
+            };
+
+            skipped = match existing {
+                Ok(existing) => existing,
+                Err(err) => {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "failed to check remote copy destination for existing files: {:#?}",
+                        err,
+                    );
+
+                    return ApiResponse::error(
+                        "failed to check the destination for existing files",
+                    )
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+                }
+            };
+
+            data.files.retain(|file| {
+                !skipped
+                    .iter()
+                    .any(|entry| entry.get("name").and_then(|name| name.as_str()) == Some(&file.to))
+            });
+            if data.files.is_empty() {
+                return ApiResponse::new_serialized(Response { skipped }).ok();
+            }
         }
 
         let mut total_size = 0;
@@ -392,11 +498,14 @@ mod post {
                     }
                 }
 
-                ApiResponse::new_serialized(Response {}).ok()
+                ApiResponse::new_serialized(Response { skipped }).ok()
             } else {
-                ApiResponse::new_serialized(ResponseAccepted { identifier })
-                    .with_status(StatusCode::ACCEPTED)
-                    .ok()
+                ApiResponse::new_serialized(ResponseAccepted {
+                    identifier,
+                    skipped,
+                })
+                .with_status(StatusCode::ACCEPTED)
+                .ok()
             }
         } else {
             if server.bandwidth.blocked() {
@@ -567,11 +676,14 @@ mod post {
                     }
                 }
 
-                ApiResponse::new_serialized(Response {}).ok()
+                ApiResponse::new_serialized(Response { skipped }).ok()
             } else {
-                ApiResponse::new_serialized(ResponseAccepted { identifier })
-                    .with_status(StatusCode::ACCEPTED)
-                    .ok()
+                ApiResponse::new_serialized(ResponseAccepted {
+                    identifier,
+                    skipped,
+                })
+                .with_status(StatusCode::ACCEPTED)
+                .ok()
             }
         }
     }

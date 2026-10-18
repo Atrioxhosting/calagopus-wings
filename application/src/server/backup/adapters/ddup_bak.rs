@@ -188,10 +188,11 @@ impl DdupBakBackup {
                 _ => 0,
             };
 
-            let mut options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
-                .compression_level(Some(compression_level.to_deflate_level() as i64))
-                .unix_permissions(entry.mode().bits())
-                .large_file(size >= u32::MAX as u64);
+            let mut options: zip::write::FileOptions<'_, '_, ()> =
+                zip::write::FileOptions::default()
+                    .compression_level(Some(compression_level.to_deflate_level() as i64))
+                    .unix_permissions(entry.mode().bits())
+                    .large_file(size >= u32::MAX as u64);
             {
                 let mtime: chrono::DateTime<chrono::Utc> = chrono::DateTime::from(entry.mtime());
 

@@ -171,12 +171,13 @@ impl Entry {
         &self,
         method: zip::CompressionMethod,
         level: Option<i64>,
-    ) -> zip::write::FileOptions<'static, ()> {
-        let mut options: zip::write::FileOptions<'static, ()> = zip::write::FileOptions::default()
-            .compression_method(method)
-            .compression_level(level)
-            .unix_permissions(self.mode)
-            .large_file(true);
+    ) -> zip::write::FileOptions<'static, 'static, ()> {
+        let mut options: zip::write::FileOptions<'static, 'static, ()> =
+            zip::write::FileOptions::default()
+                .compression_method(method)
+                .compression_level(level)
+                .unix_permissions(self.mode)
+                .large_file(true);
 
         if let Some(mtime) = self.mtime {
             options = options.last_modified_time(mtime);
@@ -185,11 +186,11 @@ impl Entry {
         options
     }
 
-    fn deflated(&self, level: i64) -> zip::write::FileOptions<'static, ()> {
+    fn deflated(&self, level: i64) -> zip::write::FileOptions<'static, 'static, ()> {
         self.options(zip::CompressionMethod::Deflated, Some(level))
     }
 
-    fn stored(&self) -> zip::write::FileOptions<'static, ()> {
+    fn stored(&self) -> zip::write::FileOptions<'static, 'static, ()> {
         self.options(zip::CompressionMethod::Stored, None)
     }
 }
@@ -672,7 +673,7 @@ mod tests {
                 continue;
             }
 
-            let name = entry.name().to_string();
+            let name = entry.name()?.to_string();
             let mut data = Vec::new();
             std::io::Read::read_to_end(&mut entry, &mut data)?;
 
@@ -726,7 +727,7 @@ mod tests {
                 continue;
             }
 
-            let name = entry.name().to_string();
+            let name = entry.name()?.to_string();
             let method = entry.compression();
 
             if name.ends_with(".mca") || name.ends_with(".jar") {
@@ -889,7 +890,7 @@ mod tests {
 
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
         for index in 0..archive.len() {
-            let name = archive.by_index(index)?.name().to_string();
+            let name = archive.by_index(index)?.name()?.to_string();
             let name = name.trim_end_matches('/');
 
             assert!(name != "game" && name != "game/csgo", "{name} was archived");

@@ -39,9 +39,7 @@ mod post {
         response::{ApiResponse, ApiResponseResult},
         routes::{
             ApiError, GetState,
-            api::system::restic::{
-                build_restic_command, execute_restic_command, system_restic_configuration,
-            },
+            api::system::restic::{execute_restic_command, system_restic_configuration},
         },
     };
     use axum::http::StatusCode;
@@ -92,23 +90,20 @@ mod post {
                 .unwrap_or_else(|| (*system_restic_configuration(&state.config)).clone()),
         );
 
-        let build = move || {
-            let mut command = build_restic_command(&state.config, &configuration);
+        let retry_lock_seconds = configuration.retry_lock_seconds;
+        let args = move |command: &mut tokio::process::Command| {
             command
                 .arg("--retry-lock")
-                .arg(format!("{}s", configuration.retry_lock_seconds))
+                .arg(format!("{retry_lock_seconds}s"))
                 .arg("prune");
 
             if data.dry_run {
                 command.arg("--dry-run");
             }
-
-            command
         };
 
         if data.foreground {
-            let command = build();
-            let result = execute_restic_command(command, "prune").await;
+            let result = execute_restic_command(&state.config, &configuration, args, "prune").await;
 
             *super::RESTIC_PRUNE_CACHE.write().await = Some(result.clone());
             *super::RESTIC_PRUNE_RUNNING.write().await = false;
@@ -116,8 +111,8 @@ mod post {
             ApiResponse::new_serialized(Response { result }).ok()
         } else {
             tokio::spawn(async move {
-                let command = build();
-                let result = execute_restic_command(command, "prune").await;
+                let result =
+                    execute_restic_command(&state.config, &configuration, args, "prune").await;
 
                 *super::RESTIC_PRUNE_CACHE.write().await = Some(result);
                 *super::RESTIC_PRUNE_RUNNING.write().await = false;

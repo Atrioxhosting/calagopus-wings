@@ -39,9 +39,7 @@ mod post {
         response::{ApiResponse, ApiResponseResult},
         routes::{
             ApiError, GetState,
-            api::system::restic::{
-                build_restic_command, execute_restic_command, system_restic_configuration,
-            },
+            api::system::restic::{execute_restic_command, system_restic_configuration},
         },
     };
     use axum::http::StatusCode;
@@ -92,19 +90,18 @@ mod post {
                 .unwrap_or_else(|| (*system_restic_configuration(&state.config)).clone()),
         );
 
-        let build = move || {
-            let mut command = build_restic_command(&state.config, &configuration);
+        let retry_lock_seconds = configuration.retry_lock_seconds;
+        let args = move |command: &mut tokio::process::Command| {
             command
+                .arg("--retry-lock")
+                .arg(format!("{retry_lock_seconds}s"))
                 .arg("stats")
                 .arg("--mode")
                 .arg(data.mode.as_deref().unwrap_or("restore-size"));
-
-            command
         };
 
         if data.foreground {
-            let command = build();
-            let result = execute_restic_command(command, "stats").await;
+            let result = execute_restic_command(&state.config, &configuration, args, "stats").await;
 
             *super::RESTIC_STATS_CACHE.write().await = Some(result.clone());
             *super::RESTIC_STATS_RUNNING.write().await = false;
@@ -112,8 +109,8 @@ mod post {
             ApiResponse::new_serialized(Response { result }).ok()
         } else {
             tokio::spawn(async move {
-                let command = build();
-                let result = execute_restic_command(command, "stats").await;
+                let result =
+                    execute_restic_command(&state.config, &configuration, args, "stats").await;
 
                 *super::RESTIC_STATS_CACHE.write().await = Some(result);
                 *super::RESTIC_STATS_RUNNING.write().await = false;

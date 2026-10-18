@@ -1,5 +1,7 @@
 use super::State;
-use crate::remote::backups::ResticBackupConfiguration;
+use crate::{
+    remote::backups::ResticBackupConfiguration, server::backup::adapters::restic::ResticBackup,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -24,25 +26,41 @@ fn build_restic_command(
     config: &crate::config::Config,
     configuration: &ResticBackupConfiguration,
 ) -> Command {
-    let mut command = Command::new("restic");
-    command
-        .envs(&configuration.environment)
-        .arg("--json")
-        .arg("--repo")
-        .arg(&configuration.repository)
-        .arg("--cache-dir")
-        .arg(crate::server::backup::adapters::restic::ResticBackup::get_restic_cache_dir(config));
-
-    if let Some(password_file) = &configuration.password_file {
-        command.arg("--password-file").arg(password_file);
-    }
+    let mut command = ResticBackup::command(config, configuration);
+    command.arg("--json");
 
     command
 }
 
-async fn execute_restic_command(mut command: Command, operation: &'static str) -> ResticTaskResult {
+async fn execute_restic_command(
+    config: &crate::config::Config,
+    configuration: &ResticBackupConfiguration,
+    args: impl Fn(&mut Command),
+    operation: &'static str,
+) -> ResticTaskResult {
     let started = chrono::Utc::now();
-    let output = command.output().await;
+    let mut retried = false;
+    let output = loop {
+        let mut command = build_restic_command(config, configuration);
+        args(&mut command);
+
+        let output = command.output().await;
+        if let Ok(output) = &output
+            && !retried
+            && ResticBackup::recover_from_lock_error(
+                config,
+                configuration,
+                output.status,
+                &String::from_utf8_lossy(&output.stderr),
+            )
+            .await
+        {
+            retried = true;
+            continue;
+        }
+
+        break output;
+    };
     let finished = chrono::Utc::now();
     let duration_ms = (finished - started).num_milliseconds().max(0) as u128;
 
@@ -78,14 +96,7 @@ async fn execute_restic_command(mut command: Command, operation: &'static str) -
 }
 
 fn system_restic_configuration(config: &crate::config::Config) -> Arc<ResticBackupConfiguration> {
-    let cfg = config.load();
-
-    Arc::new(ResticBackupConfiguration {
-        repository: cfg.system.backups.restic.repository.as_str(&cfg).into(),
-        password_file: Some(cfg.system.backups.restic.password_file.as_str(&cfg).into()),
-        retry_lock_seconds: cfg.system.backups.restic.retry_lock_seconds,
-        environment: cfg.system.backups.restic.environment.clone(),
-    })
+    Arc::new(ResticBackup::system_configuration(config))
 }
 
 pub fn router(state: &State) -> OpenApiRouter<State> {

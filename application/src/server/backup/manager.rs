@@ -140,6 +140,8 @@ impl BackupManager {
             ignore_builder.push_line(line);
         }
 
+        ignore_builder.push_line(&crate::server::filesystem::trash::ignore_line());
+
         let ignore_raw = ignore_builder.raw().to_compact_string();
         let ignore = ignore_builder.build()?;
 

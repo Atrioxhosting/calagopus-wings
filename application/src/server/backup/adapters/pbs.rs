@@ -531,7 +531,7 @@ impl BackupExt for PbsBackup {
                         };
                         let stat = entry.metadata().stat;
 
-                        let mut options: zip::write::FileOptions<'_, ()> =
+                        let mut options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),
@@ -1823,7 +1823,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
 
                     for entry in entries {
                         let name = entry.relative.to_string_lossy();
-                        let mut options: zip::write::FileOptions<'_, ()> =
+                        let mut options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),

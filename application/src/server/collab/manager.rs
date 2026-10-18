@@ -1237,7 +1237,9 @@ impl CollabManager {
 
         if !server
             .filesystem
-            .has_headroom(bytes.len() as i64 - old_content_size)
+            .trash
+            .ensure_headroom(server, bytes.len() as i64 - old_content_size)
+            .await
         {
             return Err(CollabError::User("failed to allocate space"));
         }

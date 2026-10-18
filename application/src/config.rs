@@ -117,7 +117,7 @@ fn api_file_fingerprint_threads() -> usize {
     4
 }
 fn api_upload_limit() -> MiB {
-    100u64.into()
+    0u64.into()
 }
 fn api_max_jwt_uses() -> usize {
     5

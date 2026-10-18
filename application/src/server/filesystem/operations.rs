@@ -338,6 +338,19 @@ impl OperationManager {
                 };
 
                 operations.write().await.remove(&operation_uuid);
+                if result.is_some() {
+                    sender
+                        .send(
+                            crate::server::websocket::WebsocketMessage::builder(
+                                crate::server::websocket::WebsocketEvent::ServerOperationProgress,
+                            )
+                            .arg(operation_uuid.to_compact_string())
+                            .structured_arg(&operation)
+                            .build(),
+                        )
+                        .ok();
+                }
+
                 if result.is_none() {
                     sender
                         .send(

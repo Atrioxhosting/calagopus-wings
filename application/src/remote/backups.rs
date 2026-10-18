@@ -32,17 +32,6 @@ pub struct ResticBackupConfiguration {
     pub environment: BTreeMap<String, String>,
 }
 
-impl ResticBackupConfiguration {
-    #[inline]
-    pub fn password(&self) -> Vec<compact_str::CompactString> {
-        if let Some(password_file) = &self.password_file {
-            vec!["--password-file".into(), password_file.to_compact_string()]
-        } else {
-            Vec::new()
-        }
-    }
-}
-
 #[derive(Debug, Clone, ToSchema, Deserialize)]
 pub struct PbsBackupConfiguration {
     pub url: String,

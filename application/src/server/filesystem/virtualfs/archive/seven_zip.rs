@@ -1128,7 +1128,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                             continue;
                         }
 
-                        let mut zip_options: zip::write::FileOptions<'_, ()> =
+                        let mut zip_options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),

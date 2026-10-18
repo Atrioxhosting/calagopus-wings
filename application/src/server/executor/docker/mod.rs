@@ -641,13 +641,23 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                 network_mode: Some(network_mode),
                 dns: Some(config.load().docker.network.dns.clone()),
                 dns_options: Some(config.load().docker.network.dns_options.clone()),
-                tmpfs: Some(HashMap::from([(
-                    "/tmp".to_string(),
-                    format!(
-                        "rw,exec,nosuid,size={}M",
-                        config.load().docker.tmpfs_size.as_mib()
+                tmpfs: Some(HashMap::from([
+                    (
+                        "/tmp".to_string(),
+                        format!(
+                            "rw,exec,nosuid,size={}M",
+                            config.load().docker.tmpfs_size.as_mib()
+                        ),
                     ),
-                )])),
+                    (
+                        format!(
+                            "{}/{}",
+                            crate::server::configuration::CONTAINER_ROOT,
+                            crate::server::filesystem::trash::TRASH_DIRECTORY
+                        ),
+                        TRASH_TMPFS_OPTIONS.to_string(),
+                    ),
+                ])),
                 log_config: Some(bollard::plugin::HostConfigLogConfig {
                     typ: Some(config.load().docker.log_config.r#type.clone()),
                     config: Some(
@@ -753,6 +763,9 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
         resources
     }
 }
+
+/// An empty read-only mount hiding the host-side trash directory from the container.
+const TRASH_TMPFS_OPTIONS: &str = "ro,nosuid,nodev,noexec,size=4k";
 
 const TRANSIENT_JSON_ATTEMPTS: u32 = 4;
 const TRANSIENT_JSON_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1075,10 +1088,19 @@ impl DockerExecutor {
             network_mode: Some(config.docker.network.mode.clone()),
             dns: Some(config.docker.network.dns.clone()),
             dns_options: Some(config.docker.network.dns_options.clone()),
-            tmpfs: Some(HashMap::from([(
-                "/tmp".to_string(),
-                format!("rw,exec,nosuid,size={}M", config.docker.tmpfs_size.as_mib()),
-            )])),
+            tmpfs: Some(HashMap::from([
+                (
+                    "/tmp".to_string(),
+                    format!("rw,exec,nosuid,size={}M", config.docker.tmpfs_size.as_mib()),
+                ),
+                (
+                    format!(
+                        "/mnt/server/{}",
+                        crate::server::filesystem::trash::TRASH_DIRECTORY
+                    ),
+                    TRASH_TMPFS_OPTIONS.to_string(),
+                ),
+            ])),
             log_config: Some(bollard::plugin::HostConfigLogConfig {
                 typ: Some(config.docker.log_config.r#type.clone()),
                 config: Some(
@@ -1687,6 +1709,7 @@ impl DockerProcessHandle {
             }
 
             let mut source = StatsSource::Unresolved;
+            let mut cgroup_sampled = false;
             let mut prev_cpu_total = 0;
             let mut prev_at = None;
 
@@ -1754,6 +1777,8 @@ impl DockerProcessHandle {
                             {
                                 Some(pid) => match cgroup::StatFiles::resolve(pid) {
                                     Some(files) => {
+                                        cgroup_sampled = false;
+
                                         StatsSource::Cgroup(stats_sampler.register(files))
                                     }
                                     None => {
@@ -1777,8 +1802,14 @@ impl DockerProcessHandle {
                 }
 
                 let sample = match received {
-                    Some(Ok(sample)) => sample,
-                    Some(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                    Some(Ok(sample)) => {
+                        cgroup_sampled = true;
+
+                        sample
+                    }
+                    Some(Err(err))
+                        if err.kind() == std::io::ErrorKind::NotFound && cgroup_sampled =>
+                    {
                         source = StatsSource::Unresolved;
 
                         continue;
@@ -2911,6 +2942,8 @@ impl super::ServerExecutor for DockerExecutor {
 
         let container_name = self.container_name(server).await;
 
+        server.filesystem.ensure_trash_directory().await;
+
         let bollard_config = server
             .configuration
             .read()
@@ -3128,6 +3161,8 @@ impl super::ServerExecutor for DockerExecutor {
             )
         })?;
 
+        server.filesystem.ensure_trash_directory().await;
+
         let bollard_config = bollard::plugin::ContainerCreateBody {
             host_config: Some(self.installer_host_config(
                 &server.filesystem.base(),
@@ -3289,6 +3324,8 @@ impl super::ServerExecutor for DockerExecutor {
             use std::os::unix::fs::PermissionsExt;
             tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
         }
+
+        server.filesystem.ensure_trash_directory().await;
 
         let bollard_config = bollard::plugin::ContainerCreateBody {
             host_config: Some(self.installer_host_config(

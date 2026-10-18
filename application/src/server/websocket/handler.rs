@@ -79,6 +79,8 @@ pub async fn handle_ws(
             let server = server.clone();
 
             async move {
+                let mut revocations = state.config.jwt.subscribe_revocations();
+
                 loop {
                     let user_removal_fut: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(jwt) = socket_jwt.read().await.as_ref() {
                         Box::pin(server
@@ -98,6 +100,25 @@ pub async fn handle_ws(
                             }
                             websocket_handler.close("permission revoked").await;
                             break;
+                        }
+                        _ = revocations.recv() => {
+                            let revoked = socket_jwt.read().await.as_ref().is_some_and(|jwt| {
+                                matches!(
+                                    jwt.base.validate(&state.config.jwt, Some("websocket")),
+                                    Err(crate::remote::jwt::JwtValidateError::Denied)
+                                )
+                            });
+
+                            if revoked {
+                                tracing::debug!(
+                                    server = %server.uuid,
+                                    "closing websocket due to token revocation",
+                                );
+                                websocket_handler.close("permission revoked").await;
+                                break;
+                            }
+
+                            continue;
                         }
                         data = receiver.next() => match data {
                             Some(Ok(data)) => {
