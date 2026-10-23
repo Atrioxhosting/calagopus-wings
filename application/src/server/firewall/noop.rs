@@ -21,7 +21,7 @@ impl FirewallBackend for NoopFirewall {
             return Ok(());
         }
 
-        if self.enforcing {
+        if self.enforcing || spec.container_ips.iter().any(std::net::IpAddr::is_ipv6) {
             return Err(anyhow::anyhow!(
                 "server has firewall rules configured, but no usable firewall backend is available on this host (set docker.firewall.backend to disabled to run such servers unprotected)"
             ));

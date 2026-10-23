@@ -16,6 +16,7 @@ mod database_backup;
 mod files;
 mod install;
 mod logs;
+mod network;
 mod power;
 mod reinstall;
 mod schedules;
@@ -120,6 +121,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/transfer", transfer::router(state))
         .nest("/script", script::router(state))
         .nest("/power", power::router(state))
+        .nest("/network", network::router(state))
         .nest("/version", version::router(state))
         .nest("/commands", commands::router(state))
         .nest("/sync", sync::router(state))

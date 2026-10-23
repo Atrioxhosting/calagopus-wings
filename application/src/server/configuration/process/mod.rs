@@ -341,9 +341,6 @@ impl ServerConfigurationFile {
                 }
             }
             "allocations" => match parts.get(1) {
-                Some(&"force_outgoing_ip") => {
-                    Ok(config.allocations.force_outgoing_ip.to_compact_string())
-                }
                 Some(&"default") => Self::lookup_default_allocation(server, &config, parts),
                 _ => Self::unknown_server_variable(server, parts),
             },

@@ -44,6 +44,13 @@ pub trait ProcessHandle: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait ServerExecutor: Send + Sync {
+    async fn game_network_state(
+        &self,
+        _server: uuid::Uuid,
+    ) -> Result<Vec<crate::server::game_ipv6::Endpoint>, anyhow::Error> {
+        anyhow::bail!("Native game IPv6 requires the Docker executor")
+    }
+
     async fn boot(&self) -> Result<(), anyhow::Error>;
 
     async fn setup_server_process(

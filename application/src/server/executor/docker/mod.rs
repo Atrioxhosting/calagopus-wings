@@ -455,6 +455,26 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             }
         }
 
+        if self.allocations.ipv6.is_some() {
+            for ports in self.allocations.mappings.values() {
+                for port in ports {
+                    for protocol in ["tcp", "udp"] {
+                        let bindings = map
+                            .entry(format!("{port}/{protocol}"))
+                            .or_insert_with(|| Some(Vec::new()));
+                        let binding = bollard::models::PortBinding {
+                            host_ip: Some("::".into()),
+                            host_port: Some(String::new()),
+                        };
+                        if let Some(bindings) = bindings {
+                            if !bindings.contains(&binding) {
+                                bindings.push(binding);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         map
     }
 
@@ -490,7 +510,12 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             server: self.uuid,
             bindings: bindings.into_iter().collect(),
             container_ports: container_ports.into_iter().collect(),
-            container_ips: Vec::new(),
+            container_ips: self
+                .allocations
+                .ipv6
+                .iter()
+                .filter_map(|ipv6| ipv6.address.parse().ok())
+                .collect(),
             rules: self.firewall.clone(),
             files: None,
         }
@@ -520,48 +545,19 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
         labels.insert("Service".into(), config.load().app_name.clone());
         labels.insert("ContainerType".into(), "server_process".into());
 
-        let network_mode = if self.allocations.force_outgoing_ip
-            && let Some(default) = &self.allocations.default
-        {
-            let network_name = format!("ip-{}", default.ip.replace('.', "-").replace(':', "--"));
-
-            if client.inspect_network(&network_name, None).await.is_err()
-                && let Err(err) = client
-                    .create_network(bollard::plugin::NetworkCreateRequest {
-                        name: network_name.to_string(),
-                        driver: Some("bridge".to_string()),
-                        enable_ipv6: Some(false),
-                        internal: Some(false),
-                        attachable: Some(false),
-                        ingress: Some(false),
-                        options: Some(HashMap::from([
-                            ("encryption".to_string(), "false".to_string()),
-                            (
-                                "com.docker.network.bridge.default_bridge".to_string(),
-                                "false".to_string(),
-                            ),
-                            (
-                                "com.docker.network.host_ipv4".to_string(),
-                                default.ip.to_string(),
-                            ),
-                            (
-                                "com.docker.network.driver.mtu".to_string(),
-                                config.load().docker.network.network_mtu.to_string(),
-                            ),
-                        ])),
-                        ..Default::default()
-                    })
-                    .await
+        let network_mode = if let Some(ipv6) = &self.allocations.ipv6 {
+            super::super::game_ipv6::validate(ipv6)?;
+            if self
+                .allocations
+                .mappings
+                .keys()
+                .any(|ip| ip == "127.0.0.1" || ip == "::1")
             {
-                tracing::error!(
-                    server = %self.uuid,
-                    "failed to create container network {}: {}",
-                    network_name,
-                    err
-                );
+                anyhow::bail!("Cannot publicly enable IPv6 for an internal allocation");
             }
-
-            network_name
+            let network = format!("{}_game", config.load().docker.network.name);
+            super::super::game_ipv6::ensure_network(client, config, &network, &ipv6.prefix).await?;
+            network
         } else {
             config.load().docker.network.mode.clone()
         };
@@ -615,7 +611,24 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             }
         }
 
+        let networking_config =
+            self.allocations
+                .ipv6
+                .as_ref()
+                .map(|ipv6| bollard::models::NetworkingConfig {
+                    endpoints_config: Some(HashMap::from([(
+                        network_mode.clone(),
+                        bollard::models::EndpointSettings {
+                            ipam_config: Some(bollard::models::EndpointIpamConfig {
+                                ipv6_address: Some(ipv6.address.clone()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )])),
+                });
         Ok(bollard::plugin::ContainerCreateBody {
+            networking_config,
             exposed_ports: Some(self.convert_allocations_exposed()),
             host_config: Some(bollard::plugin::HostConfig {
                 memory: resources.memory,
@@ -2160,14 +2173,17 @@ impl DockerProcessHandle {
                                 let container_id = state_id.clone();
 
                                 async move {
-                                    Self::sync_firewall(
+                                    if let Err(error) = Self::sync_firewall(
                                         &docker,
                                         &*firewall,
                                         &app_config,
                                         &server,
                                         &container_id,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        tracing::error!(%error,"Container transition firewall sync failed");
+                                    }
                                 }
                             });
                         }
@@ -2284,7 +2300,8 @@ impl DockerProcessHandle {
         app_config: &crate::config::Config,
         server: &Arc<super::super::InnerServer>,
         container_id: &str,
-    ) {
+    ) -> Result<(), anyhow::Error> {
+        let public = server.configuration.read().await.allocations.ipv6.is_some();
         let mut spec = server
             .configuration
             .read()
@@ -2295,9 +2312,14 @@ impl DockerProcessHandle {
             Ok(state) => {
                 spec.bindings = state.bindings;
                 spec.container_ports = state.container_ports;
-                spec.container_ips = state.container_ips;
+                spec.container_ips.extend(state.container_ips);
+                spec.container_ips.sort();
+                spec.container_ips.dedup();
             }
             Err(err) => {
+                if public {
+                    return Err(err.context("Cannot verify public IPv6 firewall destinations"));
+                }
                 tracing::warn!(
                     server = %spec.server,
                     "failed to read the container's published ports, firewalling the configured allocations instead: {err:#}"
@@ -2305,11 +2327,15 @@ impl DockerProcessHandle {
             }
         }
         if let Err(err) = firewall.sync(&spec).await {
+            if public {
+                return Err(err.context("Cannot apply public IPv6 firewall"));
+            }
             tracing::error!(
                 server = %spec.server,
                 "failed to sync firewall rules: {err:#}"
             );
         }
+        Ok(())
     }
 
     async fn begin_startup_boost(&self) -> bool {
@@ -2645,7 +2671,7 @@ impl super::ProcessHandle for DockerProcessHandle {
             &server,
             &self.container_id,
         )
-        .await;
+        .await?;
 
         let update_config = server
             .configuration
@@ -2677,7 +2703,7 @@ impl super::ProcessHandle for DockerProcessHandle {
                 &server,
                 &self.container_id,
             )
-            .await;
+            .await?;
         }
 
         if !self.begin_startup_boost().await {
@@ -2892,6 +2918,48 @@ async fn find_running_container(
 
 #[async_trait::async_trait]
 impl super::ServerExecutor for DockerExecutor {
+    async fn game_network_state(
+        &self,
+        server: uuid::Uuid,
+    ) -> Result<Vec<crate::server::game_ipv6::Endpoint>, anyhow::Error> {
+        let containers = self
+            .docker
+            .list_containers_settled(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([
+                    ("name".into(), vec![server.to_string()]),
+                    ("label".into(), vec!["ContainerType=server_process".into()]),
+                ])),
+                ..Default::default()
+            }))
+            .await?;
+        let mut endpoints = Vec::new();
+        for container in containers {
+            if let Some(id) = container.id {
+                let inspect = self.docker.inspect_container_settled(&id, None).await?;
+                endpoints.push(crate::server::game_ipv6::Endpoint {
+                    id,
+                    running: inspect
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.running)
+                        .unwrap_or(false),
+                    addresses: Self::endpoint_ips(&inspect)
+                        .into_iter()
+                        .filter_map(|ip| {
+                            if let std::net::IpAddr::V6(ip) = ip {
+                                Some(ip.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                });
+            }
+        }
+        Ok(endpoints)
+    }
+
     async fn boot(&self) -> Result<(), anyhow::Error> {
         self.app_config.ensure_docker_network(&self.docker).await?;
         self.firewall.boot().await?;
@@ -2969,7 +3037,9 @@ impl super::ServerExecutor for DockerExecutor {
             .convert_firewall_spec(&self.app_config);
         firewall_spec.files = Some(Self::firewall_file_access(server));
         if let Err(err) = self.firewall.sync(&firewall_spec).await {
-            if firewall_spec.rules.is_empty() {
+            if firewall_spec.rules.is_empty()
+                && server.configuration.read().await.allocations.ipv6.is_none()
+            {
                 tracing::warn!(
                     server = %server.uuid,
                     "failed to clear firewall rules: {err:#}"
@@ -3028,7 +3098,7 @@ impl super::ServerExecutor for DockerExecutor {
             server,
             &container_id,
         )
-        .await;
+        .await?;
 
         self.docker
             .apply_cfs_burst(&container_id, &self.app_config)
@@ -3057,13 +3127,6 @@ impl super::ServerExecutor for DockerExecutor {
         &self,
         server: &super::super::Server,
     ) -> Result<(), anyhow::Error> {
-        if let Err(err) = self.firewall.clear(server.uuid).await {
-            tracing::warn!(
-                server = %server.uuid,
-                "failed to clear firewall rules: {err:#}"
-            );
-        }
-
         let containers = self
             .docker
             .list_containers_settled(Some(bollard::query_parameters::ListContainersOptions {
@@ -3079,13 +3142,15 @@ impl super::ServerExecutor for DockerExecutor {
         for c in containers {
             let Some(id) = c.id else { continue };
             if let Err(err) = self.docker.remove_container_forgiving(&id).await {
-                tracing::error!(
-                    server = %server.uuid,
-                    container = %id,
-                    "failed to remove container: {}",
-                    err
-                );
+                return Err(anyhow::Error::new(err).context(format!(
+                    "failed to remove container {id}; firewall retained"
+                )));
             }
+        }
+
+        // Keep customer protection until every old endpoint has been detached.
+        if let Err(err) = self.firewall.clear(server.uuid).await {
+            tracing::warn!(server = %server.uuid, "failed to clear firewall rules: {err:#}");
         }
 
         Ok(())
@@ -3467,7 +3532,11 @@ impl super::ServerExecutor for DockerExecutor {
             .inspect_container_settled(&container_id, None)
             .await?;
 
-        let network_name = self.app_config.load().docker.network.name.clone();
+        let network_name = if server.configuration.read().await.allocations.ipv6.is_some() {
+            format!("{}_game", self.app_config.load().docker.network.name)
+        } else {
+            self.app_config.load().docker.network.name.clone()
+        };
         match inspect
             .network_settings
             .and_then(|settings| settings.networks)
@@ -3614,6 +3683,54 @@ impl super::ServerExecutor for DockerExecutor {
 mod tests {
     use super::*;
     use crate::server::configuration::ServerConfiguration;
+
+    #[tokio::test]
+    async fn game_ipv6_preserves_shared_and_dedicated_ipv4_bindings_and_deduplicates_ports() {
+        let config = crate::config::Config::mock();
+        let mut settings = ServerConfiguration::mock(uuid::Uuid::new_v4());
+        settings.allocations.mappings = HashMap::from([
+            ("82.153.147.7".into(), vec![30200, 30201]),
+            ("82.153.147.9".into(), vec![30200]),
+        ]);
+        let original = settings.convert_allocations_docker_bindings(&config);
+        settings.allocations.ipv6 = Some(crate::server::configuration::GameIpv6 {
+            address: "2a0c:b641:620:1000::1234".into(),
+            prefix: "2a0c:b641:620:1000::/64".into(),
+        });
+        let bindings = settings.convert_allocations_docker_bindings(&config);
+        for protocol in ["tcp", "udp"] {
+            for port in [30200, 30201] {
+                let key = format!("{port}/{protocol}");
+                let entries = bindings[&key].as_ref().unwrap();
+                for entry in original[&key].as_ref().unwrap() {
+                    assert!(entries.contains(entry));
+                }
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|entry| entry.host_ip.as_deref() == Some("::"))
+                        .count(),
+                    1
+                );
+                assert!(
+                    entries
+                        .iter()
+                        .filter(|entry| entry.host_ip.as_deref() == Some("::"))
+                        .all(|entry| entry.host_port.as_deref() == Some(""))
+                );
+            }
+        }
+        let spec = settings.convert_firewall_spec(&config);
+        assert_eq!(
+            spec.container_ips,
+            vec![
+                "2a0c:b641:620:1000::1234"
+                    .parse::<std::net::IpAddr>()
+                    .unwrap()
+            ]
+        );
+        assert_eq!(spec.container_ports, vec![30200, 30201]);
+    }
 
     #[cfg(unix)]
     #[test]

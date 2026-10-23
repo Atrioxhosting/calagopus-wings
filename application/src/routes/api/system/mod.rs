@@ -3,6 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod backups;
 mod config;
+mod game_network;
 mod ips;
 mod logs;
 mod overview;
@@ -47,6 +48,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .routes(routes!(get::route))
         .nest("/overview", overview::router(state))
         .nest("/ips", ips::router(state))
+        .nest("/game-network", game_network::router(state))
         .nest("/logs", logs::router(state))
         .nest("/upgrade", upgrade::router(state))
         .nest("/config", config::router(state))

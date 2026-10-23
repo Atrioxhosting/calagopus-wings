@@ -24,6 +24,7 @@ pub mod diff;
 pub mod executor;
 pub mod filesystem;
 pub mod firewall;
+pub mod game_ipv6;
 pub mod installation;
 pub mod manager;
 pub mod permissions;
@@ -97,6 +98,7 @@ pub struct InnerServer {
     transferring: AtomicBool,
     last_locked: tokio::sync::watch::Sender<i64>,
 
+    pub network_operation: Mutex<()>,
     pub restarting: AtomicBool,
     stopping: AtomicBool,
     last_crash: Mutex<Option<std::time::Instant>>,
@@ -319,6 +321,7 @@ impl Server {
             transferring: AtomicBool::new(false),
             last_locked: tokio::sync::watch::Sender::new(0),
 
+            network_operation: Mutex::new(()),
             restarting: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             last_crash: Mutex::new(None),

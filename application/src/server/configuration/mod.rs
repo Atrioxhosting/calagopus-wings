@@ -328,7 +328,9 @@ nestify::nest! {
 
         #[schema(inline)]
         pub allocations: #[derive(ToSchema, Deserialize, Serialize, PartialEq, Eq)] pub struct ServerConfigurationAllocations {
-            pub force_outgoing_ip: bool,
+            #[serde(default)]
+            pub ipv6: Option<GameIpv6>,
+
 
             #[schema(inline)]
             pub default: Option<#[derive(ToSchema, Deserialize, Serialize, PartialEq, Eq)] pub struct ServerConfigurationAllocationsDefault {
@@ -503,7 +505,7 @@ impl ServerConfiguration {
             backups: Vec::new(),
             schedules: Vec::new(),
             allocations: ServerConfigurationAllocations {
-                force_outgoing_ip: false,
+                ipv6: None,
                 default: None,
                 mappings: HashMap::new(),
             },
@@ -1270,4 +1272,10 @@ mod tests {
             assert_eq!(allowed.0, vec![allowed_root.canonicalize().unwrap()]);
         });
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct GameIpv6 {
+    pub address: String,
+    pub prefix: String,
 }
